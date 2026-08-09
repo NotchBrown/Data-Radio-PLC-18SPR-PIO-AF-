@@ -22,10 +22,10 @@ extern volatile uint8_t PORT_DI_L;   /* DI7~DI0  (PB) 输入 */
 extern volatile uint8_t PORT_DO_H;   /* DO15~DO8 (PI) 输出 */
 extern volatile uint8_t PORT_DO_L;   /* DO7~DO0  (PG) 输出 */
 
-/* 模拟量拆高低字约定 (10bit 值):
- *   _H = 高8位(值>>2), _L = 低2位(值&0x03)
- *   恢复10bit = (_H<<2)|_L
- *   帧8bit通路直接发 _H; 帧10bit通路用 (_H<<2)|_L
+/* 模拟量拆高低字约定 (10bit 值, 高位对齐, 与 adc.h/dac.h 一致):
+ *   _H = 高8位(值>>2), _L = 低2位左移到高位, 低6位=0 (值<<6 & 0xFF)
+ *   恢复10bit = (_H<<2)|(_L>>6)
+ *   帧8bit通路直接发 _H; 帧10bit通路用 (_H<<2)|(_L>>6)
  */
 /* 模拟输入 (10bit ADC2) */
 extern volatile uint8_t PORT_AI0_H, PORT_AI0_L;
