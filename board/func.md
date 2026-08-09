@@ -22,8 +22,8 @@
 1. 原计划是用模拟开关实现CAN切换+光耦，后考虑成本，放弃CAN支持
 2. DI输入引发双向光耦输出端导通时，对应的MCU上的IO变为低电平
 3. DO在MCU端侧输出低电平时，单向光耦输出测截止，此时输出NMOS对COM-导通
-4. AI将0~20mA或0~10V映射到0~3.3V，ADC的VREF=3.3V
-5. AO将0~20mA或0~10V映射到0~3.3V，DAC的VREF=3.3V
+4. AI将0~20mA或0~10V映射到0~3.3V，ADC的VREF=3.3V，AO将0~20mA或0~10V映射到0~3.3V，DAC的VREF=3.3V
+5. UART1是专用485透传，UART3是数传电台/上位机接口
 6. MCU上的RF_IRQ、CE、CSN均连接到SPI射频通信模块RA-01上
 7. MCU的SPI_CS_N连接到GD25Q64ESIGR的CS上，其中GD25Q64ESIGR的WP由另一个电路机械开关处理
 8. MCU的SPI_nSYNC连接到AD5314ARMZ上
