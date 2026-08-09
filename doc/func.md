@@ -30,4 +30,4 @@
 9. 三个指示灯（RUN_LED、DEBUG_LED、SYSTEM_LED）均是推挽点亮
 10. 两个拨码开关（RUN_CTRL和DEBUG_CTRL）使能时候应是低电平
 11. NRST和TLI均是上拉的，当对应按钮按下则变为低电平
-12. 采用了24MHz外部时钟
+12. 主时钟采用16MHz内部RC（HSI，外部晶振暂未启用）
