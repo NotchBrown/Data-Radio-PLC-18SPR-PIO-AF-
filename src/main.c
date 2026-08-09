@@ -7,16 +7,14 @@
 #include "uart3.h"
 
 /* ------------------------------------------------------------------
- * 1. 时钟: 切换到 24MHz 外部晶振 (HSE)
- *    init() 已把主时钟分频 CKDIVR 置 0, 切到 HSE 即 24MHz
+ * 1. 时钟: 使用内置 HSI 16MHz (init() 已配 HSIDIV1/CKDIVR=0),
+ *    关闭外部晶振 HSE 省电 (本阶段不用外部晶振)
  * ------------------------------------------------------------------ */
 static void clock_init(void)
 {
-    CLK_HSECmd(ENABLE);                                   /* 使能外部晶振  */
-    while (CLK_GetFlagStatus(CLK_FLAG_HSERDY) == RESET);  /* 等待振荡就绪  */
-    CLK_ClockSwitchConfig(CLK_SWITCHMODE_AUTO, CLK_SOURCE_HSE,
-                          DISABLE, CLK_CURRENTCLOCKSTATE_DISABLE);
-    CLK_HSICmd(DISABLE);                                  /* 关 HSI 省电   */
+    CLK_HSICmd(ENABLE);                                   /* 使能 HSI 16MHz */
+    while (CLK_GetFlagStatus(CLK_FLAG_HSIRDY) == RESET);  /* 等待就绪       */
+    CLK_HSECmd(DISABLE);                                  /* 关 HSE 省电    */
 }
 
 /* ------------------------------------------------------------------
@@ -44,7 +42,7 @@ static void led_sw_init(void)
 /* ------------------------------------------------------------------
  * setup(): 初始化顺序
  *   1. 时钟   -- 必须最先: TIM4/UART3 时序都依赖实际主频
- *   2. TIM4   -- 1ms 节拍, 按 24MHz 重配预分频并开中断, 紧跟时钟
+ *   2. TIM4   -- 1ms 节拍(8kHz/125us), 按 16MHz 配预分频并开中断, 紧跟时钟
  *   3. SPI    -- 软件 NSS + 各片选引脚
  *   4. DIO    -- DI 浮空输入, DO 推挽输出高
  *   5. ADC    -- ADC2 10bit 初始化
@@ -54,7 +52,7 @@ static void led_sw_init(void)
  * ------------------------------------------------------------------ */
 void setup()
 {
-    clock_init();    /* 1. 24MHz HSE        */
+    clock_init();    /* 1. 16MHz HSI        */
     timer_init();    /* 2. TIM4 1ms 节拍中断 */
     spi_init();      /* 3. SPI 主控 + 软件NSS(见 spi.c) */
     dio_init();      /* 4. DI/DO 初始化      */
@@ -62,6 +60,7 @@ void setup()
     dac_init();      /* 6. AD5314 SPI        */
     led_sw_init();   /* 7. LED + 拨码        */
     uart3_init();    /* 8. UART3 工作模式    */
+    uart3_send_id(); /* 9. 上电上报 MCU ID 帧 */
 }
 
 void loop()

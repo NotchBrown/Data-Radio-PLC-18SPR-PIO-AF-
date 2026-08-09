@@ -195,6 +195,9 @@ void uart3_init(void)
     UART3_Init(UART3_BAUD, UART3_WORDLENGTH_8D, UART3_STOPBITS_1,
                UART3_PARITY_NO, UART3_MODE_TXRX_ENABLE);
 
+    /* 关键: UART3_Init 只设 TEN/REN, 不置 UARTEN; 必须 Cmd(ENABLE) 使能 UART */
+    UART3_Cmd(ENABLE);
+
     /* 使能 RXNE 中断 (接收状态机) */
     UART3_ITConfig(UART3_IT_RXNE, ENABLE);
 
@@ -213,6 +216,17 @@ void uart3_enable(uint8_t on)
         UART3_ITConfig(UART3_IT_RXNE, DISABLE);
         UART3_Cmd(DISABLE);
     }
+}
+
+/* ==================== 上电上报 MCU ID ====================
+ * 按 upperpc.md: MCU ID 在地址 0x00~0x02 (每地址 2 字节小端)
+ * 上电主动发 3 帧 (读取帧格式 head=0x36), 供上位机识别设备
+ */
+void uart3_send_id(void)
+{
+    uint8_t i;
+    for (i = 0; i < 3; i++)
+        uart3_reply(UART3_HEAD_READ, i, uart3_read_addr(i));
 }
 
 /* ==================== 发射流程调度 ====================

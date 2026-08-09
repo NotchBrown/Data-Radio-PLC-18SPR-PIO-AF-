@@ -46,7 +46,7 @@ void adc_init(void)
 
     /* ADC2 配置 */
     /* 时钟分频: SPSEL 位在 CR1 bit6:4, 0x40 = fcpu/8
-     * fADC = 24MHz/8 = 3MHz (≤ 4MHz 转换时钟上限) */
+     * fADC = 16MHz/8 = 2MHz (≤ 4MHz 转换时钟上限) */
     ADC2->CR1 &= (uint8_t)(~0x70);   /* 清 SPSEL[2:0] */
     ADC2->CR1 |= 0x40;               /* SPSEL = 110: fADC2 = fcpu/8 = 3MHz */
 

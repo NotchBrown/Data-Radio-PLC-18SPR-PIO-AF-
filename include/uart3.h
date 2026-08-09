@@ -15,6 +15,9 @@
 /* 初始化: 115200 8N1 + RX 中断 + 状态机复位 */
 void uart3_init(void);
 
+/* 上电主动上报 MCU ID: 发 3 帧 (地址 0x00~0x02, 每帧 2 字节小端) */
+void uart3_send_id(void);
+
 /* 使能/禁用 UART3 (发射模式禁用配置口) */
 void uart3_enable(uint8_t on);
 

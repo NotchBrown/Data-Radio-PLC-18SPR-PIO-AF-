@@ -3,9 +3,9 @@
  *
  * 三个从机共用一条 SPI 总线 (SCK=PC5 / MOSI=PC6 / MISO=PC7),
  * 片选由 GPIO 手动控制, 各从机模式/速率不同:
- *   GD25Q64 flash : CS=PF0, Mode0 (上升沿), BR=/4 = 6MHz
- *   RA-01  SX1278 : NSS=PH6, Mode0 (上升沿), BR=/4 = 6MHz
- *   AD5314 DAC    : SYNC=PH7, Mode2 (下降沿), BR=/2 = 12MHz
+ *   GD25Q64 flash : CS=PF0, Mode0 (上升沿), BR=/4 = 4MHz
+ *   RA-01  SX1278 : NSS=PH6, Mode0 (上升沿), BR=/4 = 4MHz
+ *   AD5314 DAC    : SYNC=PH7, Mode2 (下降沿), BR=/2 = 8MHz
  *
  * 约定:
  *   - 每次访问从机前必须 spi_begin(slave) 配好模式/速率并拉低 CS,

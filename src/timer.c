@@ -1,13 +1,13 @@
 /*
  * timer.c - TIM4 系统节拍 + RTC 实现
- * 时钟: 24MHz 外部晶振 (HSE)
+ * 时钟: 16MHz 内部 HSI
  *
- * TIM4 12kHz 中断(83.3us)作为最小节拍, 仅供内部标志/累加使用,
- * 不对外提供 us 计数。每 12 次(=1ms, 精确)递增 RTC_MS, 再按秒/分/时/日/月/年进位。
+ * TIM4 8kHz 中断(125us)作为最小节拍, 仅供内部标志/累加使用,
+ * 不对外提供 us 计数。每 8 次(=1ms, 精确)递增 RTC_MS, 再按秒/分/时/日/月/年进位。
  *
- * 频率说明: 24MHz / 12000 = 2000 = 2^3 * 250(≤256), 可精确整除!
- *   预分频8 -> 3MHz, ARR=249 -> 周期250 -> 12000Hz 精确, 无偏差
- *   12kHz / 1000 = 12 次/ms 为整数, RTC 走时准确
+ * 频率说明: 16MHz / 8000 = 2000 = 2^3 * 250(≤256), 可精确整除!
+ *   预分频8 -> 2MHz, ARR=249 -> 周期250 -> 8000Hz 精确, 无偏差
+ *   8kHz / 1000 = 8 次/ms 为整数, RTC 走时准确
  *
  * 注意: 本固件不使用框架 Arduino 的 millis()/micros()/delay()
  *       (框架核心 wiring-millis.c 也定义 TIM4 中断, 若被链接会重复符号;
@@ -17,8 +17,8 @@
 #include "timer.h"
 #include <stm8s.h>
 
-/* 私有: 83.3us 子计数(12kHz), 每 12 次=1ms, 不对外 */
-#define TICKS_PER_MS  12
+/* 私有: 125us 子计数(8kHz), 每 8 次=1ms, 不对外 */
+#define TICKS_PER_MS  8
 static volatile uint8_t rtc_sub_ms = 0;
 
 /* RTC 全局变量(大写) */
@@ -42,12 +42,12 @@ static uint8_t days_in_month(uint8_t mon, uint8_t year)
     return dm[mon - 1];
 }
 
-/* TIM4 更新中断(向量23): 每 ~83.3us 一次
+/* TIM4 更新中断(向量23): 每 ~125us 一次
  * 使用与 stm8s_it.h 声明一致的处理器名(向量23被其占用, 不能用别的名字) */
 void TIM4_UPD_OVF_IRQHandler(void) __interrupt(ITC_IRQ_TIM4_OVF)
 {
-    /* 12kHz 最小节拍: 内部标志位用 */
-    if (++rtc_sub_ms >= TICKS_PER_MS) {   /* 12次 = 1ms(精确) */
+    /* 8kHz 最小节拍: 内部标志位用 */
+    if (++rtc_sub_ms >= TICKS_PER_MS) {   /* 8次 = 1ms(精确) */
         rtc_sub_ms = 0;
         if (++RTC_MS >= 1000) {           /* 1s */
             RTC_MS = 0;
@@ -84,7 +84,7 @@ void timer_init(void)
     RTC_MON  = 1;
     RTC_YEAR = 0;
 
-    /* 预分频8 -> 3MHz; ARR=249 -> 周期250 -> 12000Hz 精确(83.3us) */
+    /* 预分频8 -> 2MHz; ARR=249 -> 周期250 -> 8000Hz 精确(125us) */
     TIM4->PSCR = (uint8_t)TIM4_PRESCALER_8;
     TIM4->ARR  = 249;
     /* 清更新标志 */

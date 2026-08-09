@@ -30,7 +30,7 @@ static void dac_write_channel(uint8_t ch, uint8_t val_h, uint8_t val_l)
      */
     cmd = ((uint16_t)ch << 14) | 0x2000 | ((val & 0x3FF) << 2);
 
-    /* 选从机(配Mode2/12MHz + 拉低SYNC) -> 发16bit -> 释放(拉高SYNC) */
+    /* 选从机(配Mode2/8MHz + 拉低SYNC) -> 发16bit -> 释放(拉高SYNC) */
     spi_begin(SPI_SLAVE_DAC);
     spi_transfer((cmd >> 8) & 0xFF);
     spi_transfer(cmd & 0xFF);
