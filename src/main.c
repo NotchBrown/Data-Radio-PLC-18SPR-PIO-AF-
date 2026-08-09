@@ -1,9 +1,10 @@
 #include <Arduino.h>
 #include "timer.h"
+#include "spi.h"
 #include "dio.h"
-
-/* UART3 上位机配置口波特率(协议未定, 可改) */
-#define UART3_BAUD  115200UL
+#include "adc.h"
+#include "dac.h"
+#include "uart3.h"
 
 /* ------------------------------------------------------------------
  * 1. 时钟: 切换到 24MHz 外部晶振 (HSE)
@@ -19,34 +20,25 @@ static void clock_init(void)
 }
 
 /* ------------------------------------------------------------------
- * 2. SPI: 取消硬件 NSS(软件从机管理), 设置所有软件 NSS(片选)引脚
- *    CS: GD25Q64=PF0, RA-01=PH6, AD5314=PH7 (推挽输出, 初始高)
- *    SCK=PC5/MOSI=PC6 输出, MISO=PC7 浮空输入
+ * LED / 拨码 (func.md: LED 推挽高电平点亮; 拨码使能=低)
+ *   RUN_LED=PA6, DEBUG_LED=PH0, SYSTEM_LED=PH1
+ *   RUN_CTRL=PH2, DEBUG_CTRL=PH3
  * ------------------------------------------------------------------ */
-static void spi_nss_init(void)
+#define LED_RUN_ON()      (GPIOA->ODR |= 0x40)                    /* PA6 */
+#define LED_RUN_OFF()     (GPIOA->ODR &= (uint8_t)~0x40)
+#define LED_SYSTEM_ON()   (GPIOH->ODR |= 0x02)                    /* PH1 */
+#define SW_DEBUG_ON()     (!(GPIOH->IDR & 0x08))                  /* PH3 低=使能 */
+
+static void led_sw_init(void)
 {
-    /* 软件从机管理: 硬件 NSS 引脚(PE5/DI13)不再影响 SPI */
-    SPI->CR2 |= SPI_CR2_SSM | SPI_CR2_SSI;
-    SPI->CR1 |= SPI_CR1_MSTR | SPI_CR1_SPE;   /* 主机并使能 */
+    /* LED 推挽输出, 初始灭(低) */
+    GPIO_Init(GPIOA, GPIO_PIN_6, GPIO_MODE_OUT_PP_HIGH_SLOW);
+    GPIO_Init(GPIOH, GPIO_PIN_0 | GPIO_PIN_1, GPIO_MODE_OUT_PP_HIGH_SLOW);
+    GPIO_WriteLow(GPIOA, GPIO_PIN_6);
+    GPIO_WriteLow(GPIOH, GPIO_PIN_0 | GPIO_PIN_1);
 
-    pinMode(SCK,  OUTPUT);
-    pinMode(MOSI, OUTPUT);
-    pinMode(MISO, INPUT);
-
-    pinMode(PF0, OUTPUT); digitalWrite(PF0, HIGH);  /* GD25Q64 CS */
-    pinMode(PH6, OUTPUT); digitalWrite(PH6, HIGH);  /* RA-01 NSS  */
-    pinMode(PH7, OUTPUT); digitalWrite(PH7, HIGH);  /* AD5314 SYNC*/
-}
-
-/* ------------------------------------------------------------------
- * 3. UART3: 上位机配置口 (PD5=TX, PD6=RX), 8N1 收发使能
- * ------------------------------------------------------------------ */
-static void uart3_init(void)
-{
-    GPIO_Init(GPIOD, GPIO_PIN_5, GPIO_MODE_OUT_PP_HIGH_FAST); /* TX 推挽 */
-    GPIO_Init(GPIOD, GPIO_PIN_6, GPIO_MODE_IN_FL_NO_IT);      /* RX 浮空 */
-    UART3_Init(UART3_BAUD, UART3_WORDLENGTH_8D, UART3_STOPBITS_1,
-               UART3_PARITY_NO, UART3_MODE_TXRX_ENABLE);
+    /* 拨码上拉输入 (未使能=高, 使能=低) */
+    GPIO_Init(GPIOH, GPIO_PIN_2 | GPIO_PIN_3, GPIO_MODE_IN_PU_NO_IT);
 }
 
 /* ------------------------------------------------------------------
@@ -55,18 +47,45 @@ static void uart3_init(void)
  *   2. TIM4   -- 1ms 节拍, 按 24MHz 重配预分频并开中断, 紧跟时钟
  *   3. SPI    -- 软件 NSS + 各片选引脚
  *   4. DIO    -- DI 浮空输入, DO 推挽输出高
- *   5. UART3  -- 8N1 收发 (波特率由实际时钟算出)
+ *   5. ADC    -- ADC2 10bit 初始化
+ *   6. DAC    -- AD5314 初始化
+ *   7. LED/拨码 -- 指示灯 + 模式拨码
+ *   8. UART3  -- 8N1 收发 + RX 中断 (见 uart3.c)
  * ------------------------------------------------------------------ */
 void setup()
 {
     clock_init();    /* 1. 24MHz HSE        */
     timer_init();    /* 2. TIM4 1ms 节拍中断 */
-    spi_nss_init();  /* 3. SPI 软件 NSS      */
+    spi_init();      /* 3. SPI 主控 + 软件NSS(见 spi.c) */
     dio_init();      /* 4. DI/DO 初始化      */
-    uart3_init();    /* 5. UART3 工作模式    */
+    adc_init();      /* 5. ADC2 10bit        */
+    dac_init();      /* 6. AD5314 SPI        */
+    led_sw_init();   /* 7. LED + 拨码        */
+    uart3_init();    /* 8. UART3 工作模式    */
 }
 
 void loop()
 {
-    /* 后续: RF 收发、485 透传、遥测打包/解包 */
+    if (SW_DEBUG_ON()) {      /* DEBUG 拨码=使能: 发射模式 */
+        uart3_enable(0);      /* 禁用 UART3 配置口      */
+        LED_RUN_ON();         /* 运行发射: RUN LED 常亮  */
+        uart3_tx_run();       /* 发射流程调度            */
+    } else {                  /* 配置模式 */
+        uart3_enable(1);
+        LED_RUN_OFF();
+        uart3_process();      /* UART3 上位机帧处理 */
+    }
+
+    /* 后续: RF 接收、485 透传、遥测打包/解包 */
+}
+
+/* ==================================================================
+ * CPU 异常处理 (TRAP): 非法指令/软件陷阱/堆栈错误
+ * SYSTEM_LED 常亮并停机 (等看门狗复位)
+ * ================================================================== */
+void TRAP_IRQHandler(void) __trap
+{
+    LED_SYSTEM_ON();     /* SYSTEM_LED 常亮 */
+    sim();               /* 关中断 (stm8s.h, __asm__("sim")) */
+    for (;;) ;           /* 死循环           */
 }

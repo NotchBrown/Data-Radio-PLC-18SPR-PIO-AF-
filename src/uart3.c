@@ -53,6 +53,7 @@ static uint8_t  UART3_TX_CONTENT[32];
 static uint8_t  UART3_TX_ENA[32];
 static uint16_t UART3_TX_PERIOD_L[32];
 static uint16_t UART3_TX_PERIOD_H[32];
+static uint16_t UART3_TX_LAST[32];   /* 各任务上次发射时刻(ms) */
 
 /* ==================== CRC-8 (poly 0x07, init 0x00) ==================== */
 static uint8_t uart3_crc8(uint8_t crc, uint8_t byte)
@@ -202,6 +203,42 @@ void uart3_init(void)
     UART3_RX_OK = 0;
 }
 
+/* ==================== 使能/禁用 ==================== */
+void uart3_enable(uint8_t on)
+{
+    if (on) {
+        UART3_ITConfig(UART3_IT_RXNE, ENABLE);
+        UART3_Cmd(ENABLE);
+    } else {
+        UART3_ITConfig(UART3_IT_RXNE, DISABLE);
+        UART3_Cmd(DISABLE);
+    }
+}
+
+/* ==================== 发射流程调度 ====================
+ * 遍历 32 任务: ENA.bit0=1 且到周期 -> rf_send 发送"帧内容指示字段"
+ * 周期 = (H<<16|L) * 128us; 调度用 RTC 毫秒(1ms 精度)
+ * 注: 当前发送内容为内容指示字段 1 字节, 待帧打包模块扩展完整帧
+ */
+void uart3_tx_run(void)
+{
+    uint8_t i;
+    uint16_t now = rtc_get_ms();
+
+    for (i = 0; i < 32; i++) {
+        if (UART3_TX_ENA[i] & 0x01) {
+            uint32_t period = ((uint32_t)UART3_TX_PERIOD_H[i] << 16)
+                            | UART3_TX_PERIOD_L[i];
+            uint32_t ms = (uint32_t)(((uint64_t)period * 128) / 1000);
+            if (ms < 1) ms = 1;
+            if ((uint16_t)(now - UART3_TX_LAST[i]) >= ms) {
+                UART3_TX_LAST[i] = now;
+                rf_send(&UART3_TX_CONTENT[i], 1);
+            }
+        }
+    }
+}
+
 /* ==================== 主循环处理 ==================== */
 void uart3_process(void)
 {
@@ -238,8 +275,10 @@ void uart3_process(void)
 
 /* ==================== UART3 接收中断 (向量21) ====================
  * 短小状态机: 只收帧字节并置标志, 执行/回复交给主循环
+ * 带 __interrupt(ITC_IRQ_UART3_RX) 挂到中断向量;
+ * 向量槽由 stm8s_it.h 中的 INTERRUPT_HANDLER(UART3_RX_IRQHandler,21) 注册
  */
-void UART3_RX_IRQHandler(void)
+void UART3_RX_IRQHandler(void) __interrupt(ITC_IRQ_UART3_RX)
 {
     uint8_t b = UART3->DR;   /* 读数据并清 RXNE */
 
@@ -281,4 +320,9 @@ void UART3_RX_IRQHandler(void)
         UART3_STATE = ST_IDLE;
         break;
     }
+}
+
+/* UART3 TX 中断 (向量20): 未使用, 空实现 (仅满足 stm8s_it.h 注册) */
+void UART3_TX_IRQHandler(void) __interrupt(ITC_IRQ_UART3_TX)
+{
 }

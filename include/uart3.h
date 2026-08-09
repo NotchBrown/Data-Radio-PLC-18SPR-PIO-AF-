@@ -15,7 +15,14 @@
 /* 初始化: 115200 8N1 + RX 中断 + 状态机复位 */
 void uart3_init(void);
 
+/* 使能/禁用 UART3 (发射模式禁用配置口) */
+void uart3_enable(uint8_t on);
+
 /* 主循环调用: 处理完整帧 (解析/执行/回复), 含帧超时复位 */
 void uart3_process(void);
+
+/* 发射流程调度: 遍历任务表, ENA 且到周期的任务经 rf_send 发射
+ * (发射模式下由主循环调用; 周期单位 128us, 见 doc/upperpc.md) */
+void uart3_tx_run(void);
 
 #endif /* __UART3_H */
