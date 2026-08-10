@@ -18,8 +18,11 @@ void uart3_init(void);
 /* 上电主动上报 MCU ID: 发 3 帧 (地址 0x00~0x02, 每帧 2 字节小端) */
 void uart3_send_id(void);
 
-/* 使能/禁用 UART3 (发射模式禁用配置口) */
+/* 使能/禁用 UART3 (运行模式禁用配置口) */
 void uart3_enable(uint8_t on);
+
+/* 设置是否允许写入: en=0 只读(写帧被拦截并回读当前值), en=1 读写 */
+void uart3_set_write(uint8_t en);
 
 /* 主循环调用: 处理完整帧 (解析/执行/回复), 含帧超时复位 */
 void uart3_process(void);

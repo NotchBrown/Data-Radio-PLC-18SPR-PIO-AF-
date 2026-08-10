@@ -46,6 +46,7 @@ static volatile uint8_t  UART3_DH;       /* 数据高字节 */
 static volatile uint8_t  UART3_CRC;      /* CRC 累积 */
 static volatile uint8_t  UART3_READ;     /* 1=读取帧, 0=写入帧 */
 static volatile uint8_t  UART3_RX_OK;    /* 完整帧标志 */
+static volatile uint8_t  UART3_WRITE_EN; /* 0=只读(拦截写), 1=允许读写 */
 static volatile uint16_t UART3_LAST_MS;  /* 最近收字节时刻 (超时用) */
 
 /* 发射流程任务表 (32任务) */
@@ -204,6 +205,7 @@ void uart3_init(void)
     /* 状态机复位 */
     UART3_STATE = ST_IDLE;
     UART3_RX_OK = 0;
+    UART3_WRITE_EN = 1;   /* 默认允许读写, 由模式子程序覆盖 */
 }
 
 /* ==================== 使能/禁用 ==================== */
@@ -216,6 +218,12 @@ void uart3_enable(uint8_t on)
         UART3_ITConfig(UART3_IT_RXNE, DISABLE);
         UART3_Cmd(DISABLE);
     }
+}
+
+/* ==================== 只读/读写 切换 ==================== */
+void uart3_set_write(uint8_t en)
+{
+    UART3_WRITE_EN = en;
 }
 
 /* ==================== 上电上报 MCU ID ====================
@@ -279,8 +287,8 @@ void uart3_process(void)
 
     val = (uint16_t)((dh << 8) | dl);
 
-    if (UART3_READ)
-        val = uart3_read_addr(addr);
+    if (UART3_READ || !UART3_WRITE_EN)
+        val = uart3_read_addr(addr);   /* 读取帧, 或只读模式下拦截写入 */
     else
         val = uart3_write_addr(addr, val);
 
