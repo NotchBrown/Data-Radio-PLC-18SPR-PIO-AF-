@@ -1,7 +1,7 @@
 /*
  * timer.h - TIM4 系统节拍 + RTC
- * STM8S208MBT6 @ 16MHz 内部 HSI
- * TIM4 中断频率 8kHz(125us), 每 8 次=1ms(精确无漂移),
+ * STM8S208MBT6 @ 24MHz 外部 HSE
+ * TIM4 中断频率 12kHz(83us), 每 12 次=1ms(精确无漂移),
  * 中断里递增 RTC 时间变量
  *
  * 约定: 全局变量一律大写

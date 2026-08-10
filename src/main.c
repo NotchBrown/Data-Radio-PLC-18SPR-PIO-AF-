@@ -5,16 +5,30 @@
 #include "adc.h"
 #include "dac.h"
 #include "uart3.h"
+#include "mode1.h"
+#include "mode2.h"
+#include "mode3.h"
+#include "mode4.h"
 
 /* ------------------------------------------------------------------
- * 1. 时钟: 使用内置 HSI 16MHz (init() 已配 HSIDIV1/CKDIVR=0),
- *    关闭外部晶振 HSE 省电 (本阶段不用外部晶振)
+ * 1. 时钟: 使用外部无源晶振 HSE 24MHz (OSCIN/OSCOUT)
+ *    - 前提: OPT7 WAITSTATE=1 (Flash 等待状态, fCPU>16MHz 必须, 见 doc/clock.md)
+ *    - 带超时保护: 若 HSE 未就绪(晶振/负载电容问题)则保持 HSI, 不死机
  * ------------------------------------------------------------------ */
 static void clock_init(void)
 {
-    CLK_HSICmd(ENABLE);                                   /* 使能 HSI 16MHz */
-    while (CLK_GetFlagStatus(CLK_FLAG_HSIRDY) == RESET);  /* 等待就绪       */
-    CLK_HSECmd(DISABLE);                                  /* 关 HSE 省电    */
+    uint16_t guard = 0;
+
+    CLK_HSECmd(ENABLE);                                   /* 使能 HSE 24MHz */
+    while (CLK_GetFlagStatus(CLK_FLAG_HSERDY) == RESET) { /* 等 HSE 就绪     */
+        if (++guard > 100000) return;                     /* 超时: 保持 HSI  */
+    }
+
+    /* 切主时钟源到 HSE 24MHz (自动切换, 切换完成后关当前源) */
+    CLK_ClockSwitchConfig(CLK_SWITCHMODE_AUTO, CLK_SOURCE_HSE,
+                          DISABLE, CLK_CURRENTCLOCKSTATE_DISABLE);
+
+    CLK_HSICmd(DISABLE);                                  /* 关 HSI 省电    */
 }
 
 /* ------------------------------------------------------------------
@@ -24,8 +38,11 @@ static void clock_init(void)
  * ------------------------------------------------------------------ */
 #define LED_RUN_ON()      (GPIOA->ODR |= 0x40)                    /* PA6 */
 #define LED_RUN_OFF()     (GPIOA->ODR &= (uint8_t)~0x40)
+#define LED_DEBUG_ON()    (GPIOH->ODR |= 0x01)                    /* PH0 */
+#define LED_DEBUG_OFF()   (GPIOH->ODR &= (uint8_t)~0x01)
 #define LED_SYSTEM_ON()   (GPIOH->ODR |= 0x02)                    /* PH1 */
 #define SW_DEBUG_ON()     (!(GPIOH->IDR & 0x08))                  /* PH3 低=使能 */
+#define SW_RUN_ON()       (!(GPIOH->IDR & 0x04))                  /* PH2 低=使能 */
 
 static void led_sw_init(void)
 {
@@ -42,7 +59,7 @@ static void led_sw_init(void)
 /* ------------------------------------------------------------------
  * setup(): 初始化顺序
  *   1. 时钟   -- 必须最先: TIM4/UART3 时序都依赖实际主频
- *   2. TIM4   -- 1ms 节拍(8kHz/125us), 按 16MHz 配预分频并开中断, 紧跟时钟
+ *   2. TIM4   -- 1ms 节拍(12kHz/83us), 按 24MHz 配预分频并开中断, 紧跟时钟
  *   3. SPI    -- 软件 NSS + 各片选引脚
  *   4. DIO    -- DI 浮空输入, DO 推挽输出高
  *   5. ADC    -- ADC2 10bit 初始化
@@ -63,19 +80,36 @@ void setup()
     uart3_send_id(); /* 9. 上电上报 MCU ID 帧 */
 }
 
+/* ------------------------------------------------------------------
+ * loop(): 顺序 = 改变LED -> 检测拨码 -> 运行对应模式
+ *   模式号 = 1 + RUN*2 + DEBUG  (拨码使能=1, 见 doc/func.md 模式表)
+ *     模式1 DEBUG=0 RUN=0 : 只读配置
+ *     模式2 DEBUG=1 RUN=0 : 读写配置
+ *     模式3 DEBUG=0 RUN=1 : 远程发射 (待实现)
+ *     模式4 DEBUG=1 RUN=1 : 本机直通 (DI->DO, AI->AO)
+ * ------------------------------------------------------------------ */
 void loop()
 {
-    if (SW_DEBUG_ON()) {      /* DEBUG 拨码=使能: 发射模式 */
-        uart3_enable(0);      /* 禁用 UART3 配置口      */
-        LED_RUN_ON();         /* 运行发射: RUN LED 常亮  */
-        uart3_tx_run();       /* 发射流程调度            */
-    } else {                  /* 配置模式 */
-        uart3_enable(1);
-        LED_RUN_OFF();
-        uart3_process();      /* UART3 上位机帧处理 */
-    }
+    uint8_t dbg, run, mode;
 
-    /* 后续: RF 接收、485 透传、遥测打包/解包 */
+    /* 1. 先读拨码 (同周期内保持一致) */
+    dbg = SW_DEBUG_ON();
+    run = SW_RUN_ON();
+
+    /* 2. 改变 LED: 拨码使能=灯亮 */
+    if (dbg) LED_DEBUG_ON(); else LED_DEBUG_OFF();
+    if (run) LED_RUN_ON();   else LED_RUN_OFF();
+
+    /* 3. 检测拨码 -> 模式号 */
+    mode = (uint8_t)(1 + (run ? 2 : 0) + (dbg ? 1 : 0));
+
+    /* 4. switch 跳转到对应模式的周期性子程序 */
+    switch (mode) {
+    case 1: mode1_run(); break;   /* 只读配置   */
+    case 2: mode2_run(); break;   /* 读写配置   */
+    case 3: mode3_run(); break;   /* 远程发射   */
+    case 4: mode4_run(); break;   /* 本机直通   */
+    }
 }
 
 /* ==================================================================

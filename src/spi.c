@@ -1,12 +1,12 @@
 /*
  * spi.c - SPI 主控统一管理实现
  *
- * 从机模式/速率 (16MHz 主频, 见 spi.h):
- *   FLASH: Mode0, BR=/4 -> 4MHz
- *   RF   : Mode0, BR=/4 -> 4MHz
- *   DAC  : Mode2, BR=/2 -> 8MHz
+ * 从机模式/速率 (24MHz 主频, 见 spi.h):
+ *   FLASH: Mode0, BR=/4 -> 6MHz
+ *   RF   : Mode0, BR=/4 -> 6MHz
+ *   DAC  : Mode2, BR=/4 -> 6MHz  (16M 时 DAC=/2=8M, 24M 下统一 /4=6M)
  *
- * STM8S 无总线分频, SPI 外设时钟 = fMASTER = 16MHz;
+ * STM8S 无总线分频, SPI 外设时钟 = fMASTER = 24MHz;
  * SCK = fMASTER / BR, BR 仅 2 的幂分频 (/2~/256)
  */
 #include "spi.h"
@@ -17,9 +17,9 @@
 #define SPI_CFG_MASK  0x3B
 
 /* 各从机 CR1 配置值 (BR + CPOL + CPHA, 不含 MSTR/SPE/LSBFIRST) */
-#define SPI_CFG_FLASH  0x08   /* Mode0, BR=/4 -> 4MHz   */
-#define SPI_CFG_RF     0x08   /* Mode0, BR=/4 -> 4MHz   */
-#define SPI_CFG_DAC    0x02   /* Mode2, BR=/2 -> 8MHz   */
+#define SPI_CFG_FLASH  0x08   /* Mode0, BR=/4 -> 6MHz @24MHz */
+#define SPI_CFG_RF     0x08   /* Mode0, BR=/4 -> 6MHz @24MHz */
+#define SPI_CFG_DAC    0x0A   /* Mode2, BR=/4 -> 6MHz @24MHz (16M 时 0x02=/2=8M) */
 
 /* ==================== 初始化 ==================== */
 void spi_init(void)
