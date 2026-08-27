@@ -9,6 +9,7 @@
  */
 #include "rf.h"
 #include "spi.h"
+#include "rf_app.h"
 #include "timer.h"
 #include <Arduino.h>
 #include <stm8s.h>
@@ -55,6 +56,10 @@
 /* 引脚 */
 #define RF_RST_PIN  PH4
 #define RF_DIO0_PIN PH5
+
+/* 非阻塞收发状态 (TIM4 轮询; 见下方非阻塞区) */
+static uint8_t RF_ENABLED = 0;        /* rf_init 完成置位, 供 TIM4 轮询判断 */
+static volatile uint8_t RF_SPI_BUSY = 0; /* 主循环用 SPI 期间置位, TIM4 轮询让路 */
 
 /* 简单空循环延时 (项目约定不调用 delay()/millis()) */
 static void rf_delay(volatile uint32_t n)
@@ -136,6 +141,8 @@ void rf_init(void)
 
     /* LNA: 增益默认 + 开启 boost */
     rf_write_reg(REG_LNA, 0x23);
+
+    RF_ENABLED = 1;   /* 允许 TIM4 轮询接管收发 */
 }
 
 /* ==================== 发送 ==================== */
@@ -158,6 +165,74 @@ void rf_send(const uint8_t *buf, uint8_t len)
     while (!(rf_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE));
     rf_write_reg(REG_IRQ_FLAGS, 0xFF);
     rf_set_opmode(OPMODE_STDBY);
+}
+
+/* ==================== 非阻塞收发状态 ==================== */
+volatile uint8_t RF_TX_BUSY = 0;      /* 发送忙 */
+volatile uint8_t RF_TX_DONE = 0;      /* 发送完成标志 */
+volatile uint8_t RF_RX_FLAG = 0;      /* 收到一包标志 */
+volatile uint8_t RF_RX_LEN  = 0;      /* 收到的长度 */
+volatile uint8_t RF_RX_BUF[RF_RX_MAX];/* 接收缓冲 */
+
+/* 非阻塞发送: 提交一帧后立即返回; TxDone 由 TIM4 轮询清除忙状态 */
+uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
+{
+    uint8_t i;
+
+    if (RF_TX_BUSY) return 1;         /* 忙: 拒绝新任务 (上层据此亮 SYSTEM_LED) */
+
+    RF_SPI_BUSY = 1;                  /* 占用 SPI, TIM4 轮询让路 */
+    rf_set_opmode(OPMODE_STDBY);
+    rf_write_reg(REG_IRQ_FLAGS, 0xFF);  /* 清中断标志 */
+    rf_write_reg(REG_FIFO_TX_BASE, 0x00);
+    rf_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    for (i = 0; i < len; i++)
+        rf_write_reg(REG_FIFO, buf[i]);
+    rf_write_reg(REG_PAYLOAD_LENGTH, len);
+    rf_set_opmode(OPMODE_TX);         /* 进入 TX (此后 TxDone 由 TIM4 轮询收尾) */
+    RF_SPI_BUSY = 0;
+
+    RF_TX_BUSY = 1;
+    RF_TX_DONE = 0;
+    return 0;
+}
+
+/* ==================== TIM4 ISR 轮询 ====================
+ * 由 timer.c 的 TIM4 中断每 83us 调用一次:
+ *   平时只读 DIO0 电平, 无事件则立即返回 (开销极小);
+ *   有事件才做 SPI 读 + 收包入缓冲 + 清忙。
+ * 半双工: 处理完回 RXCONT (接收常态)。
+ */
+void rf_poll(void)
+{
+    uint8_t flags;
+
+    if (!RF_ENABLED || RF_SPI_BUSY) return;   /* 未初始化或主循环在用 SPI */
+    if (!(GPIOH->IDR & 0x20)) return;         /* DIO0(PH5) 低: 无事件 */
+
+    flags = rf_read_reg(REG_IRQ_FLAGS);
+
+    if (flags & IRQ_TX_DONE) {                /* 发送完成 */
+        rf_write_reg(REG_IRQ_FLAGS, 0xFF);
+        RF_TX_BUSY = 0;
+        RF_TX_DONE = 1;
+    }
+    if (flags & IRQ_RX_DONE) {                /* 收到一包 */
+        uint8_t n, i;
+        if (!(flags & IRQ_PAYLOAD_CRC_ERR)) {
+            n = rf_read_reg(REG_RX_NB_BYTES);
+            if (n > RF_RX_MAX) n = RF_RX_MAX;
+            rf_write_reg(REG_FIFO_ADDR_PTR, rf_read_reg(REG_FIFO_RX_BASE));
+            for (i = 0; i < n; i++)
+                RF_RX_BUF[i] = rf_read_reg(REG_FIFO);
+            RF_RX_LEN  = n;
+            RF_RX_FLAG = 1;
+            rf_app_rx_isr(RF_RX_BUF, n);      /* ISR 内解包, 更新输出内存 */
+        }
+        rf_write_reg(REG_IRQ_FLAGS, 0xFF);
+    }
+
+    rf_set_opmode(OPMODE_RXCONT);             /* 回接收常态 */
 }
 
 /* ==================== 接收 ==================== */
