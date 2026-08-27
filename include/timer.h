@@ -17,6 +17,9 @@ void timer_init(void);
 /* RTC 时间变量 (由 TIM4 中断递增) */
 extern volatile uint16_t RTC_MS;    /* 毫秒 0..999 */
 extern volatile uint8_t  RTC_S;     /* 秒   0..59  */
+
+/* 1ms 递增毫秒计数 (uint16 回绕, 差值运算正确; 供长周期/超时用) */
+extern volatile uint16_t TICK_MS;
 extern volatile uint8_t  RTC_MIN;   /* 分   0..59  */
 extern volatile uint8_t  RTC_HOUR;  /* 时   0..23  */
 extern volatile uint8_t  RTC_DAY;   /* 日   1..31  */

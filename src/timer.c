@@ -16,6 +16,7 @@
  *        需要延时时请基于 RTC_MS 等实现)
  */
 #include "timer.h"
+#include "rf.h"
 #include <stm8s.h>
 
 /* 私有: 最小节拍子计数, 每 TICKS_PER_MS 次=1ms (16M/8k=8, 24M/12k=12) */
@@ -30,6 +31,9 @@ volatile uint8_t  RTC_HOUR = 0;
 volatile uint8_t  RTC_DAY  = 1;
 volatile uint8_t  RTC_MON  = 1;
 volatile uint8_t  RTC_YEAR = 0;
+
+/* 1ms 递增毫秒计数 (uint16 回绕, 差值正确) */
+volatile uint16_t TICK_MS = 0;
 
 /* 当月天数(含闰年2月) */
 static uint8_t days_in_month(uint8_t mon, uint8_t year)
@@ -52,6 +56,7 @@ void TIM4_UPD_OVF_IRQHandler(void) __interrupt(ITC_IRQ_TIM4_OVF)
         rtc_sub_ms = 0;
         if (++RTC_MS >= 1000) {           /* 1s */
             RTC_MS = 0;
+            TICK_MS++;                    /* 毫秒累计 (回绕, 差值正确) */
             if (++RTC_S >= 60) {          /* 1min */
                 RTC_S = 0;
                 if (++RTC_MIN >= 60) {    /* 1h */
@@ -72,11 +77,15 @@ void TIM4_UPD_OVF_IRQHandler(void) __interrupt(ITC_IRQ_TIM4_OVF)
     }
     /* 清更新标志(写0清除) */
     TIM4->SR1 = (uint8_t)(~TIM4_IT_UPDATE);
+
+    /* RF 轮询: 检测 DIO0/RxDone/TxDone (无事件时开销极小) */
+    rf_poll();
 }
 
 void timer_init(void)
 {
     rtc_sub_ms = 0;
+    TICK_MS   = 0;
     RTC_MS   = 0;
     RTC_S    = 0;
     RTC_MIN  = 0;
