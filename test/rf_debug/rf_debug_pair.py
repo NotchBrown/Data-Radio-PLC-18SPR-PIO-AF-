@@ -28,6 +28,7 @@ import sys
 import time
 import argparse
 import threading
+import re
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -119,21 +120,35 @@ def do_rssi_test(ser_a, ser_b, hexs="00 01 02 03", ms=4000):
 
 
 def do_link(ser_a, ser_b, hexs, reverse=False):
-    """联动: 一板发帧, 另一板接收 (5s 窗口)"""
+    """联动带ACK: 发送板 tx 单帧并等ACK, 接收板靠 loop 自动接收并自动回ACK。
+    可靠方法: 不用 rx 阻塞法(已证不可靠); 接收板平时就 RXCONT(loop 自动收),
+    脚本读接收板串口的 [收]/[回ACK] 和发送板的 [ACK OK] 判断链路。"""
     tx_ser, rx_ser = (ser_b, ser_a) if reverse else (ser_a, ser_b)
     tx_name, rx_name = ("B", "A") if reverse else ("A", "B")
 
-    print("联动测试: 板%s 发帧 [%s] -> 板%s 接收(5s 窗口)..." % (tx_name, hexs, rx_name))
-    rx_ser.reset_input_buffer()
+    print("联动带ACK: 板%s 发 [%s] -> 板%s 自动收+回ACK..." % (tx_name, hexs, rx_name))
+    rx_ser.reset_input_buffer()      # 清接收板缓冲(平时一直RXCONT自动收)
     tx_ser.reset_input_buffer()
-    rx_ser.write(("rx 5000\r\n").encode("ascii"))   # 接收板先进入接收
-    time.sleep(0.3)                                  # 给接收板进 RX 一点时间
     tx_ser.write(("tx %s\r\n" % hexs).encode("ascii"))
 
-    r_tx = read_until(tx_ser, PROMPT, 2)
-    r_rx = read_until(rx_ser, PROMPT, 6)
+    r_tx = read_until(tx_ser, PROMPT, 3)      # 板tx: [TxDone]... [ACK OK]/[无ACK]
+    r_rx = read_until(rx_ser, PROMPT, 3)      # 板rx: [收]... [回ACK]
     show("板%s(tx)" % tx_name, r_tx)
     show("板%s(rx)" % rx_name, r_rx)
+
+    ok = b"[ACK OK]" in r_tx      # A 收到 ACK = 双向通(B 只有收到帧才会回 ACK)
+    print("=> %s" % ("\u2713 \u94fe\u8def\u6253\u901a(\u542bACK)!" if ok else "\u2717 \u672a\u5b8c\u5168\u6253\u901a"))
+    if not ok:
+        # 失败诊断: 读两板 OPMODE(reg 01) + 实时 RSSI
+        print("[\u8bca\u65ad] \u4e24\u677f\u72b6\u6001:")
+        for ser, name in ((tx_ser, "\u677f%s(tx)" % tx_name), (rx_ser, "\u677f%s(rx)" % rx_name)):
+            ser.reset_input_buffer()
+            ser.write(b"reg 01\r\n")
+            d1 = read_until(ser, PROMPT, 2)
+            ser.reset_input_buffer()
+            ser.write(b"rssi\r\n")
+            d2 = read_until(ser, PROMPT, 2)
+            show(name, d1 + d2)
 
 
 def do_txc_test(ser_a, ser_b, ms=4000):
@@ -182,6 +197,97 @@ def do_txcscan(ser_a, ser_b, ms=4000):
 
     show("板A(tx)", result["a"])
     show("板B(scan)", result["b"])
+
+
+def do_rfdiag(ser_a, ser_b, ms=4000):
+    """射频诊断: A txc 连发 ms 帧, B 后台循环读 RSSI。
+    A 发射时 B RSSI 升高 => 信号到了(解调问题); 不变 => 没发射/频率大偏"""
+    result = {}
+
+    def rssi_loop():
+        vals = []
+        end = time.time() + ms / 1000.0 + 0.5
+        while time.time() < end:
+            ser_b.reset_input_buffer()
+            ser_b.write(b"rssi\r\n")
+            r = read_until(ser_b, PROMPT, 0.6)
+            m = re.search(rb"RSSI=(-?\d+)dBm", r)
+            if m:
+                vals.append(int(m.group(1)))
+        result["b"] = vals
+
+    t = threading.Thread(target=rssi_loop)
+    t.start()
+    time.sleep(0.4)
+    ser_a.reset_input_buffer()
+    ser_a.write(("txc %d\r\n" % ms).encode("ascii"))
+    result["a"] = read_until(ser_a, PROMPT, ms / 1000.0 + 2)
+    t.join()
+
+    vals = result.get("b", [])
+    if vals:
+        print("\u677fB RSSI (A\u53d1\u5c04\u671f\u95f4): min=%d max=%d avg=%d"
+              % (min(vals), max(vals), sum(vals) // len(vals)))
+        if max(vals) > -80:
+            print("=> A \u4fe1\u53f7\u5df2\u5230 B (RSSI=%d), \u662f\u89e3\u8c03\u95ee\u9898(\u67e5\u63a5\u6536\u914d\u7f6e)" % max(vals))
+        else:
+            print("=> A \u4fe1\u53f7\u672a\u5230 B (\u5e95\u566a~%d), \u68c0\u67e5 A \u53d1\u5c04/PA/\u9891\u7387" % max(vals))
+    else:
+        print("=> \u672a\u91c7\u5230 RSSI \u6570\u636e")
+    show("\u677fA(tx)", result["a"])
+
+
+def do_fetest(ser_a, ser_b, offset_khz=50):
+    """FE 校正验证: A 设 470.000MHz 发 txl 标准帧, B 设 470.000+offset kHz 收帧读 FE。
+    打印 FE 实测值, 用校正公式 tuned = B当前 - FE 校正后再次读 FE 验证(应≈0)。
+    同时打印反向公式结果, 用于确定 FE 符号约定。"""
+    base = 470000000
+    b_freq = base + offset_khz * 1000
+    result = {}
+
+    def txA():
+        ser_a.reset_input_buffer()
+        ser_a.write(b"freq 470000000\r\n")
+        read_until(ser_a, PROMPT, 2)
+        ser_a.write(b"txl 80\r\n")
+        result["a"] = read_until(ser_a, PROMPT, 9)
+
+    t = threading.Thread(target=txA)
+    t.start()
+    time.sleep(0.5)
+
+    print("FE 校正验证: 板A@470.000MHz 发 txl, 板B 偏 +%dkHz 收帧读 FE..." % offset_khz)
+    ser_b.reset_input_buffer()
+    ser_b.write(("freq %d\r\n" % b_freq).encode("ascii"))
+    read_until(ser_b, PROMPT, 2)
+    ser_b.reset_input_buffer()
+    ser_b.write(b"fe\r\n")
+    r1 = read_until(ser_b, PROMPT, 5)
+    show("\u677fB(fe @ +%dkHz \u504f\u9891)" % offset_khz, r1)
+
+    m = re.search(rb"FrequencyError=(-?\d+) Hz", r1)
+    if m:
+        fe = int(m.group(1))
+        print("FE \u5b9e\u6d4b = %d Hz" % fe)
+        tuned1 = b_freq - fe
+        tuned2 = b_freq + fe
+        print("\u6821\u6b63\u516c\u5f0fA(tuned=B-f) = %d Hz\n\u6821\u6b63\u516c\u5f0fB(tuned=B+f) = %d Hz" % (tuned1, tuned2))
+        # \u7528\u516c\u5f0fA \u6821\u6b63\u540e\u9a8c\u8bc1
+        ser_b.reset_input_buffer()
+        ser_b.write(("freq %d\r\n" % tuned1).encode("ascii"))
+        read_until(ser_b, PROMPT, 2)
+        ser_b.reset_input_buffer()
+        ser_b.write(b"fe\r\n")
+        r2 = read_until(ser_b, PROMPT, 5)
+        show("\u677fB(fe @ \u6821\u6b63\u540e A)", r2)
+        m2 = re.search(rb"FrequencyError=(-?\d+) Hz", r2)
+        if m2:
+            fe2 = int(m2.group(1))
+            print("\u6821\u6b63\u540e FE = %d Hz (\u63a5\u8fd10=\u516c\u5f0fA\u6b63\u786e, \u4e0d\u63a5\u8fd10=\u8bd5\u516c\u5f0fB)" % fe2)
+    else:
+        print("\u672a\u8bfb\u5230 FE (\u677fB \u6ca1\u6536\u5230\u5e27)")
+    t.join()
+    show("\u677fA(txl)", result.get("a", b""))
 
 
 def do_freqsweep(ser_a, ser_b):
@@ -244,27 +350,37 @@ def do_freqsweep(ser_a, ser_b):
 
 
 def do_autotune(ser_a, ser_b, base="470000000", rng="400000"):
-    """并行: 板B 自动扫频精调(tune base rng), 板A 持续发真实帧(txc)。
-    板B 在后台线程跑 tune(扫±range找对端频率并校正), 板A 同时 txc 连续发帧。
-    校正成功后板B 会打印"校正成功! 本机频率设为 X Hz"。"""
+    """并行: 板B 自动扫频精调(tune base rng), 板A 明确设基准频率后用标准帧(txl)连发。
+    板B 后台跑 tune(扫±range找对端频率并 FE 精调), 板A 同时 txl 循环标准帧。
+    注意时隙: txl 100帧×~91ms ≈9.1s; tune 扫 ±400k/100k 步进×500ms ≈5s, 完全覆盖。
+    板A 先 freq base(实际发射 ≈ base+225kHz 晶振偏), 板B 扫到即 FE 校正。
+    关键: 板A 必须用 txl(标准帧) 而非 txc(连续模式出非标准帧, 接收端解不出 RxDone)。
+    固件 tune 已改为"收到任一帧(CRC对/错)都读 FE", 更鲁棒。
+    验证点: 校正后板B 频率应 ≈ 板A 实际发射频率(≈470.225MHz 当 base=470)。
+    若校正值明显相反方向, 说明 FE 符号反了(代码 tuned=f-fe 需改 f+fe)。"""
     result = {}
-    print("自动扫频精调: 板B tune(±%sHz) + 板A txc 连发 ..." % rng)
+    print("自动扫频精调: 板A freq=%sHz 连发 + 板B tune(±%sHz) ..." % (base, rng))
 
     def tune_wait():
         ser_b.reset_input_buffer()
         ser_b.write(("tune %s %s\r\n" % (base, rng)).encode("ascii"))
-        # tune 扫描约 (2*range/step)*300ms, 给足时间
-        steps = int(rng) * 2 // 100000 + 2
-        result["b"] = read_until(ser_b, PROMPT, steps * 0.4 + 3)
+        # tune 扫描: 25kHz 步进 (± range), 每点 ~600ms rx 阻塞
+        # 点数 = 2*range/25000, 总时长 ≈ 点数 * 0.6s
+        steps = int(rng) * 2 // 25000 + 2
+        result["b"] = read_until(ser_b, PROMPT, steps * 0.7 + 3)
 
     t = threading.Thread(target=tune_wait)
     t.start()
-    time.sleep(0.4)
+    time.sleep(0.3)
     ser_a.reset_input_buffer()
-    ser_a.write(b"txc 60000\r\n")   # 板A 长时间连发 (tune 全扫期间保持发帧)
-    # 板A txc 最长10s, 与 tune 同步推进; 用较短的轮次便于看到进度
+    ser_a.write(("freq %s\r\n" % base).encode("ascii"))   # 板A 设基准频率
+    _ = read_until(ser_a, PROMPT, 2)      # 等板A 确认改频, 再发 txl (状态确定, 输出不被吞)
+    # 关键: 用 txl(标准单帧循环≈9.1s) 而不是 txc!
+    # crcscan 注释已记录: txc(TX连续模式)产生非标准帧, 接收端解不出 RxDone -> 永远扫不到。
+    # 已验证可靠配置 = 板A txl + 板B RXCONT 轮询 (crcscan 用此法找到 0x40 打通链路)。
+    ser_a.write(b"txl 100\r\n")
     result["a"] = read_until(ser_a, PROMPT, 12)
-    t.join(timeout=20)
+    t.join(timeout=25)
     if t.is_alive():
         print("[提示] tune 仍在后台运行, 等待完成...")
         t.join()
@@ -298,42 +414,66 @@ def do_txlscan(ser_a, ser_b, ms=4000):
 
 
 def do_crcscan(ser_a, ser_b):
-    """CRC 微调扫描: 板A 在候选频率用标准帧(txl)发, 板B 用 scan 看 irq 标志。
-    irq=0x40 = RxDone 无 CRC = 链路打通!   irq=0x60 = RxDone+CRC错
-    之前用 rx 阻塞收一帧方法不可靠, 改用 scan(和 txlscan 同款可靠时序)。"""
-    freqs = [469800000, 469900000, 469950000, 470000000,
-             470050000, 470100000, 470200000]
-    print("CRC 微调扫描(scan法): 板A 标准帧 txl + 板B scan看irq ...")
+    """CRC 微调扫描(修正时序版): 板A 标准帧(txl) + 板B scan 看 irq。
+    之前全"未收到"的根因(非信号问题, 是测试时隙):
+      1) scan 1500ms + txl 15帧: 每帧~91ms, 发射窗口 t=0.55~1.92s,
+         而 scan 窗口只到 1.5s, 后半段发射在窗口外, 边缘损耗 -> 假未收到。
+         修正: 改用与 txlscan 同款长时序 scan 5000 + txl 40(发射完全落在窗口内)。
+      2) 据 freqsweep: 板A 晶振偏高 ~+225~300kHz, 板B@470 的匹配点在
+         板A 设定 ~469.7MHz, 旧列表从 469.8 起漏掉匹配区。修正: 补 469.6~469.8 细扫。
+      3) 首轮固定 470/470 做对照, 先验证测试方法可靠(应见 0x60)再扫频, 不盲目试错。
+    帧同步/位同步条件(txl 每帧含前导码+header)与 txlscan 完全一致, 不改变。
+    irq: 0x40=RxDone无CRC(链路打通) 0x60=RxDone+CRC错 0x10=ValidHeader"""
+    import re
+    # 细扫匹配区(据 freqsweep 板A 需设定 ~469.7) + 470 附近 + 高段
+    freqs = [469600000, 469700000, 469725000, 469750000, 469775000,
+             469800000, 469900000, 470000000, 470100000, 470200000,
+             470300000]
+    seq = [470000000] + freqs   # 首轮固定 470/470 对照
+    print("CRC 微调扫描(修正时序): 板A txl + 板B scan ...")
+    print("  首轮对照: 固定 470/470MHz, 验证测试方法(应见 0x60 或 0x40)")
     found = False
-    for f in freqs:
+    for idx, f in enumerate(seq):
+        tag = "\u5bf9\u7167" if idx == 0 else "\u626b\u9891"
         result = {}
         def rx_scan():
             ser_b.reset_input_buffer()
-            ser_b.write(b"scan 1500\r\n")
-            result["b"] = read_until(ser_b, PROMPT, 2.5)
+            ser_b.write(b"scan 5000\r\n")
+            result["b"] = read_until(ser_b, PROMPT, 7)
         t = threading.Thread(target=rx_scan)
         t.start()
-        time.sleep(0.35)
+        time.sleep(0.3)
         ser_a.reset_input_buffer()
         ser_a.write(("freq %d\r\n" % f).encode("ascii"))
-        time.sleep(0.2)
-        ser_a.write(b"txl 15\r\n")
-        result["a"] = read_until(ser_a, PROMPT, 2.5)
+        time.sleep(0.4)                  # 等板A 改频+稳定
+        ser_a.write(b"txl 40\r\n")       # 40帧*~91ms ≈ 3.6s, 完全落在 scan 5000 内
+        result["a"] = read_until(ser_a, PROMPT, 7)
         t.join()
 
         text = result.get("b", b"").decode("utf-8", errors="replace")
-        if "[irq=0x40]" in text:
-            print("  %8.3f MHz: \u2713 RxDone \u65e0CRC \u94fe\u8def\u6253\u901a\uff01" % (f / 1e6))
-            show("板A(tx)", result["a"])
-            show("板B(scan)", result["b"])
-            found = True
-            break
-        elif "[irq=0x60]" in text:
-            print("  %8.3f MHz: RxDone\u4f46CRC\u9519" % (f / 1e6))
+        hits = set(int(v, 16) for v in re.findall(r"irq=0x([0-9A-Fa-f]{2})", text))
+        if 0x40 in hits:
+            crc_ok = (0x60 not in hits)
+            if crc_ok:
+                print("  [%s] %8.3f MHz: \u2713 RxDone \u65e0CRC \u94fe\u8def\u6253\u901a\uff01" % (tag, f / 1e6))
+                show("\u677fA(tx)", result["a"])
+                show("\u677fB(scan)", result["b"])
+                found = True
+            else:
+                print("  [%s] %8.3f MHz: RxDone \u4f46\u671f\u95f4\u4e5f\u6709 CRC \u9519 (0x40+0x60 \u6df7\u5408)" % (tag, f / 1e6))
+            if found:
+                break
+        elif 0x60 in hits:
+            print("  [%s] %8.3f MHz: \u6536\u5230\u4f46 CRC \u9519 (0x60)" % (tag, f / 1e6))
+        elif 0x10 in hits:
+            print("  [%s] %8.3f MHz: \u53ea\u540c\u6b65\u5230\u5934 (0x10)" % (tag, f / 1e6))
         else:
-            print("  %8.3f MHz: \u672a\u6536\u5230" % (f / 1e6))
+            print("  [%s] %8.3f MHz: \u672a\u6536\u5230" % (tag, f / 1e6))
     if not found:
-        print("  => \u672a\u627e\u5230 CRC \u6b63\u786e\u9891\u7387, \u8bd5\u6269\u5927\u8303\u56f4\u6216\u68c0\u67e5\u8c03\u5236")
+        print("  => \u672a\u627e\u5230\u7eaf\u5782 CRC \u6b63\u786e\u9891\u7387")
+        print("     \u82e5\u5168\u90e8\u90fd\u662f 0x60(\u6536\u5230\u4f46CRC\u9519) -> \u9891\u7387\u504f\u5dee\u662f\u6839\u56e0,")
+        print("     \u63a5\u7740\u8dd1 autotune \u8ba9\u677fB \u7528 FrequencyError \u81ea\u52a8\u5bf9\u51c6")
+        print("     \u82e5\u8fde\u5bf9\u7167\u90fd\u672a\u6536\u5230 -> \u65f6\u5e8f\u4ecd\u6709\u95ee\u9898,\u68c0\u67e5\u4e32\u53e3/scan")
 
 
 def help_text():
@@ -346,6 +486,8 @@ def help_text():
   rssitest [hex]  并行诊断: 板B监听RSSI + 板A连发(默认 00 01 02 03)
   txctest         并行诊断: 板A连续发真实LoRa帧 + 板B接收(解调)
   txcscan         并行: 板A连续发帧 + 板B scan看解调标志
+  rfdiag          射频诊断: A连发 + B循环读RSSI(分辨信号到达/解调)
+  fetest [khz]     FE验证: A发帧 + B偏频读FE + 校正验证(默认偏50kHz)
   txlscan         并行: 板A循环标准帧 + 板B scan看解调标志
   crcscan         并行: 板A标准帧扫频 + 板B判断CRC(找链路打通频率)
   freqsweep       频率扫描: 板A扫频发射 + 板B固定470MHz收, 测频率偏差
@@ -403,6 +545,12 @@ def main():
                 do_txc_test(ser_a, ser_b)
             elif cmd == "txcscan":
                 do_txcscan(ser_a, ser_b)
+            elif cmd == "rfdiag":
+                do_rfdiag(ser_a, ser_b)
+            elif cmd == "fetest":
+                parts = arg.split()
+                off = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 50
+                do_fetest(ser_a, ser_b, off)
             elif cmd == "txlscan":
                 do_txlscan(ser_a, ser_b)
             elif cmd == "crcscan":

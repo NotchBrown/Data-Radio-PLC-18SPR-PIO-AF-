@@ -66,6 +66,7 @@ void rf_dbg_set_power(int8_t dbm);
 
 /* 阻塞发一帧 (len<=255) */
 void rf_dbg_tx(const uint8_t *buf, uint8_t len);
+void rf_dbg_rx_full(void);
 
 /* 阻塞收一包: 返回 1=收到OK 2=收到但CRC错(*len回填, 带rssi/snr) 0=超时 */
 uint8_t rf_dbg_rx(uint8_t *buf, uint8_t *len, uint16_t timeout_ms,

@@ -200,19 +200,26 @@ static void cmd_txl(char *s)
     rf_dbg_rx_start();
 }
 
-/* 读 FrequencyError: 进 RX 等一帧(需对端发帧), 收到后打印频偏 */
+/* 读 FrequencyError: 进 RX 等一帧(需对端发帧), 收到后打印频偏。
+ * 用 rx_check 非阻塞轮询(可靠), 不用 rf_dbg_rx 阻塞法(已证不可靠)。 */
 static void cmd_fe(char *s)
 {
     uint8_t buf[64], len;
     int32_t fe;
-    printf("进 RX 等一帧读 FrequencyError (需对端发帧)...\r\n");
-    if (rf_dbg_rx(buf, &len, 2000, NULL, NULL) == 1) {
-        fe = rf_dbg_read_fe();
-        printf("收到 %uB, FrequencyError=%ld Hz (正=对端频率比本机高)\r\n", len, (long)fe);
-    } else {
-        printf("超时/无包\r\n");
+    uint8_t r;
+    unsigned long t;
+    printf("收一帧读 FrequencyError (需对端发帧)...\r\n");
+    rf_dbg_rx_start();
+    for (t = 0; t < 300; t++) {        /* 3s 窗口 */
+        r = rf_dbg_rx_check(buf, &len, NULL, NULL);
+        if (r == 1 || r == 2) {        /* 收到帧(CRC 对/错)都读 FE */
+            fe = rf_dbg_read_fe();
+            printf("收到 %uB, FrequencyError=%ld Hz (正=对端频率比本机高)\r\n", len, (long)fe);
+            return;
+        }
+        delay(10);
     }
-    rf_dbg_rx_start();   /* 回到连续接收 */
+    printf("超时/无包\r\n");
 }
 
 /* 自动扫频精调: 在 base±range kHz 内扫, 找能锁定对端的频率并校正 */
@@ -270,8 +277,9 @@ static void cmd_tx(char *s)
         unsigned long t;
         for (t = 0; t < 100; t++) {
             ar = rf_dbg_rx_check(abuf, &alen, &arssi, &asnr);
-            if (ar == 2) { printf("[ACK OK] rssi=%ddBm\r\n", arssi); return; }
-            if (ar == 1) {
+            if (ar == 3) { printf("[等ACK收到CRC错] %uB rssi=%ddBm\r\n", alen, arssi); }
+            else if (ar == 2) { printf("[ACK OK] rssi=%ddBm\r\n", arssi); return; }
+            else if (ar == 1) {
                 uint8_t i;
                 printf("[等ACK时收到数据] %uB:", alen);
                 for (i = 0; i < alen; i++) printf(" %02X", abuf[i]);
@@ -401,6 +409,7 @@ static void cmd_dispatch(char *s)
         if (tok) {
             unsigned long f = parse_dec(tok);
             rf_dbg_set_freq(f);
+            rf_dbg_rx_start();              /* 改频后正确初始化: 重进 RXCONT(带ERRATA) */
             printf("载波频率=%lu Hz\r\n", f);
         } else printf("用法: freq <hz>\r\n");
     } else if (!strcmp(tok, "sf")) {
@@ -463,10 +472,18 @@ static void cmd_dispatch(char *s)
         rf_dbg_set_ack(parse_dec(rest) != 0);
         printf("ACK %s (收到数据帧自动回 0xAA)\r\n", RF_DBG_ACK ? "开" : "关");
     } else if (!strcmp(tok, "rssi")) {
+        /* 修 bug: 读实时 RSSI 0x1B(RegRssiValue), 不是 0x1A(PktRssiValue=上一包,
+         * 没收到包时=0 显示溢出假象)。多次采样平均抗噪。
+         * 定标用(2023B CW 信号测 RSSI 峰值)必须用实时值。 */
+        int i, sum = 0;
         rf_dbg_write_reg(RF_REG_OPMODE,
                          (rf_dbg_read_reg(RF_REG_OPMODE) & ~0x07) | 0x05); /* RXCONT */
-        delay(100);
-        printf("RSSI=%ddBm\r\n", (int)((int16_t)rf_dbg_read_reg(RF_REG_PKT_RSSI) - 164));
+        delay(50);
+        for (i = 0; i < 10; i++) {
+            sum += rf_dbg_cur_rssi();      /* 0x1B 实时信道 RSSI */
+            delay(10);
+        }
+        printf("RSSI=%ddBm\r\n", sum / 10);
         rf_dbg_write_reg(RF_REG_OPMODE,
                          (rf_dbg_read_reg(RF_REG_OPMODE) & ~0x07) | 0x01); /* STDBY */
     } else if (!strcmp(tok, "dump")) {
