@@ -27,20 +27,33 @@ void rf_send(const uint8_t *buf, uint8_t len);
 uint8_t rf_receive(uint8_t *buf, uint8_t *len, uint16_t timeout_ms);
 
 /* ---- 非阻塞收发 (TIM4 ISR 轮询驱动) ---- */
-/* 接收缓冲最大长度 */
+/* 单帧最大长度 */
 #define RF_RX_MAX  64
+/* 环形接收缓冲帧数: ISR 快速搬入原始帧, 主循环解析 (防溢出) */
+#define RF_RX_QUEUE 8
+
+/* SPI 占用标志 (主循环 RF 发送/DAC 写期间置位, TIM4 RF 轮询让路保时序) */
+extern volatile uint8_t RF_SPI_BUSY;
 
 /* 非阻塞发送: 提交一帧; 返回 1=忙(拒绝, 上层亮 SYSTEM_LED), 0=已提交 */
 uint8_t rf_tx_start(const uint8_t *buf, uint8_t len);
 
-/* TIM4 ISR 轮询 (timer.c 调用): 处理 RxDone/TxDone/接收缓冲 */
+/* TIM4 ISR 轮询 (timer.c 调用): 检测 DIO0, 处理 TxDone/RxDone */
 void rf_poll(void);
+
+/* 主循环: 从环形接收缓冲取一帧; 返回 1=取到(*len/rssi/snr 回填), 0=空 */
+uint8_t rf_rx_pop(uint8_t *buf, uint8_t *len, int8_t *rssi, int8_t *snr);
+
+/* 频偏校正 (控制指令 0x26~0x28, 单位 Hz; 默认关闭, 仅开关打开才校正):
+ * 读 FEI(0x28~0x2A) 估频偏(Hz), 返回 1=有效; rf_set_freq_offset 应用校正 */
+uint8_t rf_freq_correct_measure(int32_t *out_hz);
+void   rf_set_freq_offset(int16_t offset_hz);   /* 载波 = RF_FREQ_HZ + offset */
 
 /* 收发状态 (ISR/主循环共享, 原子读) */
 extern volatile uint8_t RF_TX_BUSY;  /* 发送忙 (rf_tx_start 置位, TxDone 清除) */
 extern volatile uint8_t RF_TX_DONE;  /* 发送完成标志 (TxDone 置位) */
-extern volatile uint8_t RF_RX_FLAG;  /* 收到一包标志 (读走缓冲后清) */
-extern volatile uint8_t RF_RX_LEN;   /* 收到的长度 */
-extern volatile uint8_t RF_RX_BUF[RF_RX_MAX]; /* 接收缓冲 */
+extern volatile uint8_t RF_RX_OVF;   /* 环形缓冲溢出标志 (置1 -> 主循环亮 SYS 灯) */
+extern volatile int8_t  RF_LAST_RSSI;/* 最近一帧 RSSI (dBm, 主循环解析时更新) */
+extern volatile int8_t  RF_LAST_SNR; /* 最近一帧 SNR (dB) */
 
 #endif /* __RF_H */

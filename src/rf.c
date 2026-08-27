@@ -32,12 +32,33 @@
 #define REG_FIFO_ADDR_PTR   0x0D
 #define REG_FIFO_TX_BASE    0x0E
 #define REG_FIFO_RX_BASE    0x0F
+#define REG_IRQ_FLAGS_MASK  0x11
 #define REG_IRQ_FLAGS       0x12
 #define REG_RX_NB_BYTES     0x13
+#define REG_PKT_SNR         0x19
+#define REG_PKT_RSSI        0x1A
+#define REG_RSSI_VALUE      0x1B
 #define REG_MODEM_CONFIG_1  0x1D
 #define REG_MODEM_CONFIG_2  0x1E
-#define REG_MODEM_CONFIG_3  0x1F
+#define REG_SYMB_TIMEOUT_LSB 0x1F   /* 0x1F 是符号超时低字节(不是 ModemConfig3!) */
+#define REG_PREAMBLE_MSB    0x20
+#define REG_PREAMBLE_LSB    0x21
 #define REG_PAYLOAD_LENGTH  0x22
+#define REG_MAX_PAYLOAD_LENGTH 0x23
+#define REG_HOP_PERIOD      0x24
+#define REG_MODEM_CONFIG_3  0x26   /* 真正地址, 非 0x1F */
+#define REG_FEI_MSB         0x28
+#define REG_FEI_MID         0x29
+#define REG_FEI_LSB         0x2A
+#define REG_DETECTOPTIMIZE  0x31
+#define REG_DETECTIONTHRESHOLD 0x37
+#define REG_TEST30          0x30
+#define REG_TEST2F          0x2F
+#define REG_TEST36          0x36
+#define REG_INVERTIQ        0x33
+#define REG_INVERTIQ2       0x3B   /* LoRa 模式 0x3B=INVERTIQ2 (FSK=IMAGECAL) */
+#define REG_IMAGECAL        0x3B   /* FSK 模式 0x3B=IMAGECAL */
+#define REG_SYNC_WORD       0x39
 #define REG_VERSION         0x42
 
 /* OPMODE 位 */
@@ -59,7 +80,7 @@
 
 /* 非阻塞收发状态 (TIM4 轮询; 见下方非阻塞区) */
 static uint8_t RF_ENABLED = 0;        /* rf_init 完成置位, 供 TIM4 轮询判断 */
-static volatile uint8_t RF_SPI_BUSY = 0; /* 主循环用 SPI 期间置位, TIM4 轮询让路 */
+volatile uint8_t RF_SPI_BUSY = 0; /* 主循环 SPI 事务(RF发送/DAC)期间置位, TIM4 轮询让路 */
 
 /* 简单空循环延时 (项目约定不调用 delay()/millis()) */
 static void rf_delay(volatile uint32_t n)
@@ -97,13 +118,74 @@ uint8_t rf_read_version(void)
     return rf_read_reg(REG_VERSION);
 }
 
-/* 设置载波频率 (Frf = f*2^19/32MHz) */
+/* 设置载波频率 (Frf = f*2^19/32MHz; 用浮点避免 SDCC (uint64)<<19 溢出 bug) */
 void rf_set_frequency(uint32_t freq_hz)
 {
-    uint32_t frf = (uint32_t)(((uint64_t)freq_hz << 19) / 32000000UL);
+    double d = (double)freq_hz * 524288.0 / 32000000.0;
+    uint32_t frf = (uint32_t)d;
     rf_write_reg(REG_FRF_MSB, (frf >> 16) & 0xFF);
     rf_write_reg(REG_FRF_MID, (frf >> 8) & 0xFF);
     rf_write_reg(REG_FRF_LSB, frf & 0xFF);
+}
+
+/* ==================== 频偏校正测量 (控制指令 0x26/模式3 自动) ====================
+ * FEI (REG 0x28~0x2A) 是 LoRa 收到一帧后的频率误差估计 (19bit 补码步数),
+ * 仅在收到帧后有效。Fstep = Fxtal/2^19 = 32M/2^19 ≈ 61.035Hz。
+ */
+uint8_t rf_freq_correct_measure(int32_t *out_hz)
+{
+    uint8_t msb, mid, lsb, sign;
+    int32_t fei;
+
+    if (!RF_ENABLED || !out_hz) return 0;
+
+    msb  = rf_read_reg(REG_FEI_MSB);
+    mid  = rf_read_reg(REG_FEI_MID);
+    lsb  = rf_read_reg(REG_FEI_LSB);
+    sign = (uint8_t)(msb & 0x08);              /* bit19 符号位 */
+    fei  = ((int32_t)(msb & 0x07) << 16)
+         | ((int32_t)mid << 8) | (int32_t)lsb; /* 19bit */
+    if (sign) fei -= 524288;                   /* 2^19 补码 -> 有符号 */
+
+    *out_hz = fei * 61;                        /* Fstep ≈ 61.035Hz -> Hz */
+    return 1;
+}
+
+/* 应用频偏校正: 载波 = RF_FREQ_HZ + offset_hz */
+void rf_set_freq_offset(int16_t offset_hz)
+{
+    rf_set_frequency((uint32_t)((int32_t)RF_FREQ_HZ + offset_hz));
+}
+
+/* ==================== 接收链校准 ====================
+ * 必须在 reset 后、FSK 模式(0x3B=IMAGECAL)下做!
+ * 关键: 0x3B 在 FSK=IMAGECAL, LoRa=INVERTIQ2。
+ * 若在 LoRa 模式校准会写错寄存器 -> I/Q 解调异常(RSSI 正常但解调不出帧)。 */
+static void rf_rx_chain_cal(void)
+{
+    uint8_t pa = rf_read_reg(REG_PA_CONFIG);
+    volatile uint32_t guard = 0;
+    rf_write_reg(REG_PA_CONFIG, 0x00);        /* 切断 PA */
+    rf_write_reg(REG_IMAGECAL, 0x40);         /* IMAGECAL_START (LF) */
+    while ((rf_read_reg(REG_IMAGECAL) & 0x20) && (guard++ < 100000)) ;  /* 等 RUNNING 清 */
+    rf_write_reg(REG_PA_CONFIG, pa);
+}
+
+/* 进 RXCONT (轻量, 无校准): 每次重做 I/Q 极性 + ERRATA 2.3 + 接收检测配置 + mask。
+ * 校准只在 init 做一次(FSK 模式); 这里不含校准以保持 ISR 轻量。 */
+static void rf_rx_start(void)
+{
+    rf_set_opmode(OPMODE_STDBY);
+    rf_write_reg(REG_INVERTIQ, (rf_read_reg(REG_INVERTIQ) & 0xBE) | 0x01);  /* RX off + TX off */
+    rf_write_reg(REG_INVERTIQ2, 0x1D);        /* INVERTIQ2 off (LoRa 模式 0x3B) */
+    rf_write_reg(REG_DETECTOPTIMIZE, (rf_read_reg(REG_DETECTOPTIMIZE) & 0x7F) | 0x03); /* SF7-12 + 清bit7 */
+    rf_write_reg(REG_TEST30, 0x00);
+    rf_write_reg(REG_TEST2F, 0x40);           /* ERRATA 2.3 BW125 */
+    rf_write_reg(REG_IRQ_FLAGS_MASK, 0x1F);   /* RX: 屏蔽 TxDone/ValidHeader 等 */
+    rf_write_reg(REG_IRQ_FLAGS, 0xFF);
+    rf_write_reg(REG_FIFO_RX_BASE, 0x00);
+    rf_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    rf_set_opmode(OPMODE_RXCONT);
 }
 
 /* ==================== 初始化 ==================== */
@@ -120,27 +202,47 @@ void rf_init(void)
     digitalWrite(RF_RST_PIN, HIGH);
     rf_delay(1000);
 
-    /* 进入 Sleep 并切到 LoRa 模式 */
+    /* Rx 链校准: reset 后、FSK 模式(0x3B=IMAGECAL)下做 (官方时序) */
+    rf_write_reg(REG_OPMODE, 0x01);           /* FSK STDBY */
+    rf_delay(500);
+    rf_rx_chain_cal();
+
+    /* Sleep + LongRange (LoRa) */
+    rf_write_reg(REG_OPMODE, 0x00);           /* Sleep (FSK) */
+    rf_delay(500);
     rf_write_reg(REG_OPMODE, OPMODE_LONGRANGE | OPMODE_SLEEP);
+    rf_delay(500);
     rf_set_opmode(OPMODE_STDBY);
 
     /* 载波频率 */
     rf_set_frequency(RF_FREQ_HZ);
 
-    /* 调制参数 (与上方宏对应, 改宏时同步改这里):
+    /* 调制参数 (对齐官方/调试固件; 显式头必须设 PayloadLength/MaxPayloadLength
+     * 接收链才能启动):
      * MC1: BW125=0x70 | CR4/5=0x02 | 显式头 = 0x72
      * MC2: SF7=0x70 | RX CRC 使能=0x04 = 0x74
-     * MC3: AGC 自动 = 0x04
-     */
+     * MC3: AGC 自动 = 0x04 (地址 0x26, 不是 0x1F!) */
     rf_write_reg(REG_MODEM_CONFIG_1, 0x72);
     rf_write_reg(REG_MODEM_CONFIG_2, 0x74);
     rf_write_reg(REG_MODEM_CONFIG_3, 0x04);
+    rf_write_reg(REG_SYMB_TIMEOUT_LSB, 0x64);      /* 符号超时 100 */
+    rf_write_reg(REG_PREAMBLE_MSB, 0x00);
+    rf_write_reg(REG_PREAMBLE_LSB, 0x08);          /* 前导码 8 符号 */
+    rf_write_reg(REG_PAYLOAD_LENGTH, 255);
+    rf_write_reg(REG_MAX_PAYLOAD_LENGTH, 255);
+    rf_write_reg(REG_HOP_PERIOD, 0x00);
+    rf_write_reg(REG_SYNC_WORD, 0x12);
 
     /* 发射功率: PA_BOOST(bit7) | OutputPower(13dBm=0x0B) */
     rf_write_reg(REG_PA_CONFIG, 0x80 | 0x0B);
-
-    /* LNA: 增益默认 + 开启 boost */
     rf_write_reg(REG_LNA, 0x23);
+
+    /* 接收机检测配置 (官方 SX1276SetModem): TEST36=0x03 (非500k, ERRATA 2.1) */
+    rf_write_reg(REG_TEST36, 0x03);
+
+    /* 进 RXCONT (含 I/Q 极性 + ERRATA 2.3 + mask) */
+    rf_rx_start();
+    rf_delay(500);
 
     RF_ENABLED = 1;   /* 允许 TIM4 轮询接管收发 */
 }
@@ -149,30 +251,46 @@ void rf_init(void)
 void rf_send(const uint8_t *buf, uint8_t len)
 {
     uint8_t i;
+    uint16_t w;
 
     rf_set_opmode(OPMODE_STDBY);
-    rf_write_reg(REG_IRQ_FLAGS, 0xFF);          /* 清中断标志 */
+    rf_write_reg(REG_IRQ_FLAGS_MASK, 0x17);   /* 允许 TxDone, 否则等不到(会死锁) */
+    rf_write_reg(REG_IRQ_FLAGS, 0xFF);        /* 清中断标志 */
 
-    /* 写 FIFO */
-    rf_write_reg(REG_FIFO_TX_BASE, 0x00);
-    rf_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    /* 写 FIFO (用 0x80, 避免与 RX 基址 0x00 重叠) */
+    rf_write_reg(REG_FIFO_TX_BASE, 0x80);
+    rf_write_reg(REG_FIFO_ADDR_PTR, 0x80);
     for (i = 0; i < len; i++)
         rf_write_reg(REG_FIFO, buf[i]);
     rf_write_reg(REG_PAYLOAD_LENGTH, len);
 
-    /* 进入 TX, 阻塞等 TxDone */
+    /* 进入 TX, 阻塞等 TxDone (带超时防死锁) */
     rf_set_opmode(OPMODE_TX);
-    while (!(rf_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE));
+    for (w = 0; w < 500; w++) {
+        if (rf_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE) break;
+        rf_delay(500);
+    }
     rf_write_reg(REG_IRQ_FLAGS, 0xFF);
-    rf_set_opmode(OPMODE_STDBY);
+    rf_rx_start();       /* 发完回接收 (含 I/Q/ERRATA/mask 配置) */
 }
 
 /* ==================== 非阻塞收发状态 ==================== */
 volatile uint8_t RF_TX_BUSY = 0;      /* 发送忙 */
 volatile uint8_t RF_TX_DONE = 0;      /* 发送完成标志 */
-volatile uint8_t RF_RX_FLAG = 0;      /* 收到一包标志 */
-volatile uint8_t RF_RX_LEN  = 0;      /* 收到的长度 */
-volatile uint8_t RF_RX_BUF[RF_RX_MAX];/* 接收缓冲 */
+
+/* ---- 环形接收缓冲: ISR 快速搬入原始帧, 主循环解析 (防溢出) ---- */
+typedef struct {
+    uint8_t data[RF_RX_MAX];   /* 原始帧 */
+    uint8_t len;
+    int8_t  rssi;              /* 该帧 RSSI (dBm) */
+    int8_t  snr;               /* 该帧 SNR (dB) */
+} RF_QITEM;
+static volatile RF_QITEM RF_RX_Q[RF_RX_QUEUE];
+static volatile uint8_t  RF_RX_Q_WR = 0;   /* 写指针 (ISR) */
+static volatile uint8_t  RF_RX_Q_RD = 0;   /* 读指针 (主循环) */
+volatile uint8_t RF_RX_OVF = 0;            /* 溢出标志: 主循环亮 SYS 灯 */
+volatile int8_t  RF_LAST_RSSI = -127;      /* 最近一帧 RSSI */
+volatile int8_t  RF_LAST_SNR  = 0;         /* 最近一帧 SNR */
 
 /* 非阻塞发送: 提交一帧后立即返回; TxDone 由 TIM4 轮询清除忙状态 */
 uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
@@ -183,9 +301,10 @@ uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
 
     RF_SPI_BUSY = 1;                  /* 占用 SPI, TIM4 轮询让路 */
     rf_set_opmode(OPMODE_STDBY);
+    rf_write_reg(REG_IRQ_FLAGS_MASK, 0x17);   /* 关键: 允许 TxDone, 否则 rf_poll 等不到 */
     rf_write_reg(REG_IRQ_FLAGS, 0xFF);  /* 清中断标志 */
-    rf_write_reg(REG_FIFO_TX_BASE, 0x00);
-    rf_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    rf_write_reg(REG_FIFO_TX_BASE, 0x80);
+    rf_write_reg(REG_FIFO_ADDR_PTR, 0x80);
     for (i = 0; i < len; i++)
         rf_write_reg(REG_FIFO, buf[i]);
     rf_write_reg(REG_PAYLOAD_LENGTH, len);
@@ -207,7 +326,9 @@ void rf_poll(void)
 {
     uint8_t flags;
 
-    if (!RF_ENABLED || RF_SPI_BUSY) return;   /* 未初始化或主循环在用 SPI */
+    /* SPI 被主循环占用(RF 发送/DAC)时让路: 接收数据留芯片内 FIFO(RxDone 保持),
+     * 发送 SPI 事务先完成, 之后 SPI 空闲再搬 -> 时序不乱 + 不丢数据 */
+    if (!RF_ENABLED || RF_SPI_BUSY) return;
     if (!(GPIOH->IDR & 0x20)) return;         /* DIO0(PH5) 低: 无事件 */
 
     flags = rf_read_reg(REG_IRQ_FLAGS);
@@ -216,23 +337,50 @@ void rf_poll(void)
         rf_write_reg(REG_IRQ_FLAGS, 0xFF);
         RF_TX_BUSY = 0;
         RF_TX_DONE = 1;
+        rf_rx_start();                        /* 发完回接收(含 I/Q/ERRATA/mask 配置) */
+        return;
     }
-    if (flags & IRQ_RX_DONE) {                /* 收到一包 */
+    if (flags & IRQ_RX_DONE) {                /* 收到一包: 快速搬入环形缓冲(不解析) */
         uint8_t n, i;
         if (!(flags & IRQ_PAYLOAD_CRC_ERR)) {
             n = rf_read_reg(REG_RX_NB_BYTES);
             if (n > RF_RX_MAX) n = RF_RX_MAX;
             rf_write_reg(REG_FIFO_ADDR_PTR, rf_read_reg(REG_FIFO_RX_BASE));
-            for (i = 0; i < n; i++)
-                RF_RX_BUF[i] = rf_read_reg(REG_FIFO);
-            RF_RX_LEN  = n;
-            RF_RX_FLAG = 1;
-            rf_app_rx_isr(RF_RX_BUF, n);      /* ISR 内解包, 更新输出内存 */
+            {
+                uint8_t nxt = (uint8_t)(RF_RX_Q_WR + 1) % RF_RX_QUEUE;
+                if (nxt == RF_RX_Q_RD) {
+                    RF_RX_OVF = 1;            /* 环形缓冲满: 溢出, 主循环亮 SYS 灯 */
+                } else {
+                    RF_RX_Q[RF_RX_Q_WR].len = n;
+                    for (i = 0; i < n; i++)
+                        RF_RX_Q[RF_RX_Q_WR].data[i] = rf_read_reg(REG_FIFO);
+                    RF_RX_Q[RF_RX_Q_WR].rssi = (int8_t)((int16_t)rf_read_reg(REG_PKT_RSSI) - 164);
+                    RF_RX_Q[RF_RX_Q_WR].snr  = (int8_t)((int8_t)rf_read_reg(REG_PKT_SNR) / 4);
+                    RF_RX_Q_WR = nxt;
+                }
+            }
+        } else {
+            RF_APP_CRC_CNT++;                 /* 统计: CRC 错帧 */
         }
         rf_write_reg(REG_IRQ_FLAGS, 0xFF);
+        rf_rx_start();                        /* 回接收(含配置) */
     }
+}
 
-    rf_set_opmode(OPMODE_RXCONT);             /* 回接收常态 */
+/* 主循环: 从环形接收缓冲取一帧; 取到则清溢出标志(恢复, 灭溢出灯) */
+uint8_t rf_rx_pop(uint8_t *buf, uint8_t *len, int8_t *rssi, int8_t *snr)
+{
+    if (RF_RX_Q_RD == RF_RX_Q_WR) return 0;
+    {
+        uint8_t n = RF_RX_Q[RF_RX_Q_RD].len, i;
+        for (i = 0; i < n; i++) buf[i] = RF_RX_Q[RF_RX_Q_RD].data[i];
+        *len = n;
+        if (rssi) *rssi = RF_RX_Q[RF_RX_Q_RD].rssi;
+        if (snr)  *snr  = RF_RX_Q[RF_RX_Q_RD].snr;
+        RF_RX_Q_RD = (uint8_t)(RF_RX_Q_RD + 1) % RF_RX_QUEUE;
+        RF_RX_OVF = 0;                        /* 已恢复处理, 灭溢出灯 */
+        return 1;
+    }
 }
 
 /* ==================== 接收 ==================== */
@@ -241,12 +389,7 @@ uint8_t rf_receive(uint8_t *buf, uint8_t *len, uint16_t timeout_ms)
     uint16_t t0 = rtc_get_ms();
     uint8_t n, i;
 
-    rf_set_opmode(OPMODE_STDBY);
-    rf_write_reg(REG_IRQ_FLAGS, 0xFF);
-    rf_write_reg(REG_FIFO_RX_BASE, 0x00);
-    rf_write_reg(REG_FIFO_ADDR_PTR, 0x00);
-
-    rf_set_opmode(OPMODE_RXCONT);
+    rf_rx_start();   /* 完整接收配置 (I/Q/ERRATA/mask/FIFO) */
 
     for (;;) {
         uint8_t flags = rf_read_reg(REG_IRQ_FLAGS);
