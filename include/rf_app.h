@@ -28,6 +28,7 @@ extern volatile uint8_t RF_APP_OVERFLOW;
 
 /* 收发统计 + 频偏校正请求 (控制指令 0x21/0x22/0x26 用) */
 extern volatile uint16_t RF_APP_RX_CNT;     /* 收到有效帧计数 */
+extern volatile uint16_t RF_APP_TX_CNT;     /* 发送帧计数 (含握手/重传) */
 extern volatile uint16_t RF_APP_CRC_CNT;    /* CRC 错帧计数 (rf.c 递增) */
 extern volatile uint8_t  RF_APP_FE_REQUEST; /* 频偏校正请求 (uart3 0x26 触发) */
 

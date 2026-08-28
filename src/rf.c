@@ -10,7 +10,9 @@
 #include "rf.h"
 #include "spi.h"
 #include "rf_app.h"
+#include "uart3.h"
 #include "timer.h"
+#include "dbg.h"
 #include <Arduino.h>
 #include <stm8s.h>
 
@@ -80,7 +82,7 @@
 
 /* 非阻塞收发状态 (TIM4 轮询; 见下方非阻塞区) */
 static uint8_t RF_ENABLED = 0;        /* rf_init 完成置位, 供 TIM4 轮询判断 */
-volatile uint8_t RF_SPI_BUSY = 0; /* 主循环 SPI 事务(RF发送/DAC)期间置位, TIM4 轮询让路 */
+volatile uint8_t RF_SPI_BUSY = 0; /* SPI 占用计数(>0=占用): spi_begin/end + 长事务; TIM4 rf_poll 让路 */
 
 /* 简单空循环延时 (项目约定不调用 delay()/millis()) */
 static void rf_delay(volatile uint32_t n)
@@ -151,10 +153,10 @@ uint8_t rf_freq_correct_measure(int32_t *out_hz)
     return 1;
 }
 
-/* 应用频偏校正: 载波 = RF_FREQ_HZ + offset_hz */
+/* 应用频偏校正: 载波 = UART3_RF_FREQ + offset_hz */
 void rf_set_freq_offset(int16_t offset_hz)
 {
-    rf_set_frequency((uint32_t)((int32_t)RF_FREQ_HZ + offset_hz));
+    rf_set_frequency((uint32_t)((int32_t)UART3_RF_FREQ + offset_hz));
 }
 
 /* ==================== 接收链校准 ====================
@@ -188,6 +190,49 @@ static void rf_rx_start(void)
     rf_set_opmode(OPMODE_RXCONT);
 }
 
+/* ==================== 按配置应用 RF 参数 ====================
+ * 按 UART3_RF_* (0x30~0x38, 可存 EEPROM) 配置 SX1278: 载波频率 + 调制(SF/BW/CR) +
+ * 功率 + 前导 + 同步字 + LNA, 然后进 RXCONT。空速由 SF/BW/CR 自动算。
+ * 在 rf_init 后调用; uart3_config_restore 恢复 EEPROM 后也需重新调用。 */
+void rf_apply_config(void)
+{
+    uint8_t bw_code, cr_code, sf_code, mc1, mc2;
+
+    /* 载波频率 */
+    rf_set_frequency(UART3_RF_FREQ);
+
+    /* ModemConfig1: BW(bit7:4) | CR(bit3:1) | 显式头(bit0=0) */
+    bw_code = (UART3_RF_BW == 125) ? 7 : (UART3_RF_BW == 250) ? 8 : 9;
+    cr_code = (uint8_t)(UART3_RF_CR - 4);          /* 5->1, 6->2, 7->3, 8->4 */
+    if (cr_code < 1 || cr_code > 4) cr_code = 1;
+    mc1 = (uint8_t)((bw_code << 4) | (cr_code << 1));
+    rf_write_reg(REG_MODEM_CONFIG_1, mc1);
+
+    /* ModemConfig2: SF(bit7:4) | RX CRC on(bit2) */
+    if (UART3_RF_SF < 6) UART3_RF_SF = 7;
+    if (UART3_RF_SF > 12) UART3_RF_SF = 12;
+    sf_code = (uint8_t)((UART3_RF_SF << 4) & 0xF0);
+    mc2 = (uint8_t)(sf_code | 0x04);
+    rf_write_reg(REG_MODEM_CONFIG_2, mc2);
+
+    rf_write_reg(REG_MODEM_CONFIG_3, 0x04);        /* AGC 自动 */
+    rf_write_reg(REG_SYMB_TIMEOUT_LSB, 0x64);      /* 符号超时 */
+
+    /* 前导码 */
+    rf_write_reg(REG_PREAMBLE_MSB, (uint8_t)(UART3_RF_PREAMBLE >> 8));
+    rf_write_reg(REG_PREAMBLE_LSB, (uint8_t)(UART3_RF_PREAMBLE & 0xFF));
+
+    /* 发射功率 (PA_BOOST | dBm) */
+    rf_write_reg(REG_PA_CONFIG, 0x80 | (UART3_RF_POWER & 0x0F));
+    /* LNA */
+    rf_write_reg(REG_LNA, UART3_RF_LNA);
+    /* 同步字 */
+    rf_write_reg(REG_SYNC_WORD, UART3_RF_SYNCWORD);
+
+    /* 进 RXCONT (含 I/Q 极性 + ERRATA 2.3 + mask) */
+    rf_rx_start();
+}
+
 /* ==================== 初始化 ==================== */
 void rf_init(void)
 {
@@ -214,34 +259,15 @@ void rf_init(void)
     rf_delay(500);
     rf_set_opmode(OPMODE_STDBY);
 
-    /* 载波频率 */
-    rf_set_frequency(RF_FREQ_HZ);
+    /* 按 UART3_RF_* 配置载波/调制/功率/前导/同步/LNA + 进 RXCONT */
+    rf_apply_config();
 
-    /* 调制参数 (对齐官方/调试固件; 显式头必须设 PayloadLength/MaxPayloadLength
-     * 接收链才能启动):
-     * MC1: BW125=0x70 | CR4/5=0x02 | 显式头 = 0x72
-     * MC2: SF7=0x70 | RX CRC 使能=0x04 = 0x74
-     * MC3: AGC 自动 = 0x04 (地址 0x26, 不是 0x1F!) */
-    rf_write_reg(REG_MODEM_CONFIG_1, 0x72);
-    rf_write_reg(REG_MODEM_CONFIG_2, 0x74);
-    rf_write_reg(REG_MODEM_CONFIG_3, 0x04);
-    rf_write_reg(REG_SYMB_TIMEOUT_LSB, 0x64);      /* 符号超时 100 */
-    rf_write_reg(REG_PREAMBLE_MSB, 0x00);
-    rf_write_reg(REG_PREAMBLE_LSB, 0x08);          /* 前导码 8 符号 */
     rf_write_reg(REG_PAYLOAD_LENGTH, 255);
     rf_write_reg(REG_MAX_PAYLOAD_LENGTH, 255);
     rf_write_reg(REG_HOP_PERIOD, 0x00);
-    rf_write_reg(REG_SYNC_WORD, 0x12);
-
-    /* 发射功率: PA_BOOST(bit7) | OutputPower(13dBm=0x0B) */
-    rf_write_reg(REG_PA_CONFIG, 0x80 | 0x0B);
-    rf_write_reg(REG_LNA, 0x23);
 
     /* 接收机检测配置 (官方 SX1276SetModem): TEST36=0x03 (非500k, ERRATA 2.1) */
     rf_write_reg(REG_TEST36, 0x03);
-
-    /* 进 RXCONT (含 I/Q 极性 + ERRATA 2.3 + mask) */
-    rf_rx_start();
     rf_delay(500);
 
     RF_ENABLED = 1;   /* 允许 TIM4 轮询接管收发 */
@@ -277,6 +303,7 @@ void rf_send(const uint8_t *buf, uint8_t len)
 /* ==================== 非阻塞收发状态 ==================== */
 volatile uint8_t RF_TX_BUSY = 0;      /* 发送忙 */
 volatile uint8_t RF_TX_DONE = 0;      /* 发送完成标志 */
+volatile uint16_t RF_TX_START_MS = 0; /* 发送开始时刻 (TICK_MS, 超时兜底用) */
 
 /* ---- 环形接收缓冲: ISR 快速搬入原始帧, 主循环解析 (防溢出) ---- */
 typedef struct {
@@ -299,7 +326,7 @@ uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
 
     if (RF_TX_BUSY) return 1;         /* 忙: 拒绝新任务 (上层据此亮 SYSTEM_LED) */
 
-    RF_SPI_BUSY = 1;                  /* 占用 SPI, TIM4 轮询让路 */
+    RF_SPI_BUSY++;                  /* 长事务占用 SPI (计数), TIM4 轮询让路 */
     rf_set_opmode(OPMODE_STDBY);
     rf_write_reg(REG_IRQ_FLAGS_MASK, 0x17);   /* 关键: 允许 TxDone, 否则 rf_poll 等不到 */
     rf_write_reg(REG_IRQ_FLAGS, 0xFF);  /* 清中断标志 */
@@ -309,11 +336,22 @@ uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
         rf_write_reg(REG_FIFO, buf[i]);
     rf_write_reg(REG_PAYLOAD_LENGTH, len);
     rf_set_opmode(OPMODE_TX);         /* 进入 TX (此后 TxDone 由 TIM4 轮询收尾) */
-    RF_SPI_BUSY = 0;
+    RF_SPI_BUSY--;                    /* 释放 (内部各步 spi_begin/end 已 ++/--) */
 
     RF_TX_BUSY = 1;
     RF_TX_DONE = 0;
+    RF_TX_START_MS = TICK_MS;
     return 0;
+}
+
+/* ==================== 发送超时兜底 ====================
+ * TxDone 长时间未检测到时强制回接收, 防 RF_TX_BUSY 卡死 (SYS 灯/后续发送/接收全堵)
+ * 由主循环 rf_app_poll 检测 500ms 超时后调用
+ */
+void rf_abort_tx(void)
+{
+    RF_TX_BUSY = 0;
+    rf_rx_start();
 }
 
 /* ==================== TIM4 ISR 轮询 ====================
@@ -326,20 +364,28 @@ void rf_poll(void)
 {
     uint8_t flags;
 
+
+
     /* SPI 被主循环占用(RF 发送/DAC)时让路: 接收数据留芯片内 FIFO(RxDone 保持),
      * 发送 SPI 事务先完成, 之后 SPI 空闲再搬 -> 时序不乱 + 不丢数据 */
     if (!RF_ENABLED || RF_SPI_BUSY) return;
-    if (!(GPIOH->IDR & 0x20)) return;         /* DIO0(PH5) 低: 无事件 */
 
-    flags = rf_read_reg(REG_IRQ_FLAGS);
-
-    if (flags & IRQ_TX_DONE) {                /* 发送完成 */
-        rf_write_reg(REG_IRQ_FLAGS, 0xFF);
-        RF_TX_BUSY = 0;
-        RF_TX_DONE = 1;
-        rf_rx_start();                        /* 发完回接收(含 I/Q/ERRATA/mask 配置) */
+    /* 发送忙: 直接轮询 IRQ_FLAGS 查 TxDone (不依赖 DIO0 的 TX 模式映射,
+     * 实测 DIO0 发送完成后不拉高 -> 卡 RF_TX_BUSY + 卡 TX 模式不接收) */
+    if (RF_TX_BUSY) {
+        flags = rf_read_reg(REG_IRQ_FLAGS);
+        if (flags & IRQ_TX_DONE) {            /* 发送完成 */
+            rf_write_reg(REG_IRQ_FLAGS, 0xFF);
+            RF_TX_BUSY = 0;
+            RF_TX_DONE = 1;
+            rf_rx_start();                    /* 发完回接收(含 I/Q/ERRATA/mask 配置) */
+        }
         return;
     }
+
+    if (!(GPIOH->IDR & 0x20)) return;         /* 非发送: DIO0(PH5) 低无事件 */
+    flags = rf_read_reg(REG_IRQ_FLAGS);
+
     if (flags & IRQ_RX_DONE) {                /* 收到一包: 快速搬入环形缓冲(不解析) */
         uint8_t n, i;
         if (!(flags & IRQ_PAYLOAD_CRC_ERR)) {
