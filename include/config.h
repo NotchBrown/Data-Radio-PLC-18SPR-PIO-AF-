@@ -12,7 +12,7 @@
 
 /* 配置区魔法数 / 版本 (EEPROM 校验用; 布局变更需升版本使旧数据失效) */
 #define CFG_MAGIC   0x5A
-#define CFG_VERSION 0x05
+#define CFG_VERSION 0x06
 
 /* 射频可持久化寄存器白名单数量 */
 #define RF_CFG_N    14
@@ -20,21 +20,41 @@
 /* 配置表快照 (与 EEPROM 布局对应, 见 doc/upperpc.md) */
 typedef struct {
     uint8_t  rf_cfg[RF_CFG_N];   /* 射频白名单寄存器值 (读自 SX1278) */
-    uint8_t  tx_content[32];     /* 发射任务: 内容指示字段 */
+    uint8_t  tx_content[32];     /* 发射任务: CI₁ (主站→从站内容指示) */
+    uint8_t  tx_ci2[32];         /* 发射任务: CI₂ (要求从站回传内容指示) */
     uint8_t  tx_ena[32];         /* 发射任务: 使能 bit0 */
     uint16_t tx_period_l[32];    /* 发射任务: 执行周期低 16bit (小端) */
     uint16_t tx_period_h[32];    /* 发射任务: 执行周期高 16bit (小端) */
     uint8_t  self_addr;          /* 本机 RF 地址 */
     uint8_t  peer_addr;          /* 对端 RF 地址 */
-    uint8_t  rf_mode;            /* 收发模式 1..4 (见 doc/upperpc.md) */
-    uint8_t  rf_role;            /* 模式3 主从: 0=从机 1=主机 */
+    uint8_t  rf_mode;            /* 收发模式: 固定 0 (统一异步主从) */
+    uint8_t  rf_role;            /* 主从: 0=从机 1=主机 (0x19) */
+    /* RF 高层参数 (0x30~0x38, 上电按此配 SX1278, 空速自动算) */
+    uint32_t rf_freq;            /* 载波频率 Hz (0x30/0x31) */
+    uint8_t  rf_sf;              /* 扩频因子 6~12 (0x32) */
+    uint8_t  rf_bw;              /* 带宽 125/250/500 kHz (0x33) */
+    uint8_t  rf_cr;              /* 编码率 5~8 = 4/5..4/8 (0x34) */
+    uint8_t  rf_power;           /* 发射功率 dBm (0x35) */
+    uint8_t  rf_preamble;        /* 前导码长度 (0x36) */
+    uint8_t  rf_syncword;        /* 同步字 (0x37) */
+    uint8_t  rf_lna;             /* LNA 增益 (0x38) */
     int16_t  fe_value;           /* 频偏校正值 (Hz, ±32767, 地址 0x27) */
-    uint8_t  fe_enable;          /* 频偏校正开关: 0=关(默认) 1=开 (地址 0x28) */
-    uint16_t uart1_baud;         /* UART1 485 波特率 (地址 0x1A, 数值) */
-    uint8_t  uart1_buf_max;      /* UART1 485 接收缓冲上限 (地址 0x1B, 1~127) */
-    uint16_t uart1_timeout;      /* UART1 485 组帧超时 ms (地址 0x1C) */
-    uint8_t  uart1_en;           /* UART1 485 透传使能 (地址 0x1D): 0=关 1=开 */
+    uint8_t  fe_enable;          /* 频偏校正开关 (0x28) */
+    uint16_t uart1_baud;         /* UART1 485 波特率 (0x1A) */
+    uint8_t  uart1_buf_max;      /* UART1 485 缓冲上限 (0x1B) */
+    uint16_t uart1_timeout;      /* UART1 485 组帧超时 ms (0x1C) */
+    uint8_t  uart1_en;           /* UART1 485 透传使能 (0x1D) */
 } config_table_t;
+
+/* 固件默认 RF 参数 (config 无效/未保存时用; 见 rf.c) */
+#define CFG_DFLT_FREQ   470000000UL
+#define CFG_DFLT_SF     7
+#define CFG_DFLT_BW     125
+#define CFG_DFLT_CR     5
+#define CFG_DFLT_POWER  13
+#define CFG_DFLT_PREAMBLE 8
+#define CFG_DFLT_SYNCWORD 0x12
+#define CFG_DFLT_LNA    0x23
 
 /* 射频白名单寄存器号 (供上层组快照用, 定义在 config.c) */
 extern const uint8_t RF_CFG_REGS[RF_CFG_N];
