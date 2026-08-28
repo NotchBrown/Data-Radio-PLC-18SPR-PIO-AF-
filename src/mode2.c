@@ -4,10 +4,12 @@
  */
 #include "mode2.h"
 #include "uart3.h"
+#include "rf_app.h"
 
 void mode2_run(void)
 {
     uart3_enable(1);      /* 允许 UART3 配置口  */
     uart3_set_write(1);   /* 允许读写           */
     uart3_process();      /* 处理上位机帧       */
+    rf_app_poll();        /* RF 公共维护(接收解析/控制指令) */
 }

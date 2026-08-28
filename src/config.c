@@ -22,25 +22,35 @@
 #define CFG_OFF_MAGIC   0
 #define CFG_OFF_VERSION 1
 #define CFG_OFF_RF      2          /* 射频白名单 RF_CFG_N 字节 */
-#define CFG_OFF_CONTENT 16         /* 发射任务: CONTENT[32] */
-#define CFG_OFF_ENA     48         /* 发射任务: ENA[32] */
-#define CFG_OFF_PERIODL 80         /* 发射任务: PERIOD_L[32] (u16 小端) */
-#define CFG_OFF_PERIODH 144        /* 发射任务: PERIOD_H[32] (u16 小端) */
-#define CFG_OFF_SELF    208        /* 本机 RF 地址 */
-#define CFG_OFF_PEER    209        /* 对端 RF 地址 */
-#define CFG_OFF_MODE    210        /* 收发模式 */
-#define CFG_OFF_ROLE    211        /* 模式3 主从: 0=从机 1=主机 */
-#define CFG_OFF_FE_LO   212        /* 频偏校正值 低字节 (有符号 Hz) */
-#define CFG_OFF_FE_HI   213        /* 频偏校正值 高字节 */
-#define CFG_OFF_FE_EN   214        /* 频偏校正开关: 0=关 1=开 */
-#define CFG_OFF_U1_BDL  215        /* UART1 485 波特率 低字节 */
-#define CFG_OFF_U1_BDH  216        /* UART1 485 波特率 高字节 */
-#define CFG_OFF_U1_BMAX 217        /* UART1 485 接收缓冲上限 (1~127) */
-#define CFG_OFF_U1_TOL  218        /* UART1 485 组帧超时 低字节 (ms) */
-#define CFG_OFF_U1_TOH  219        /* UART1 485 组帧超时 高字节 */
-#define CFG_OFF_U1_EN   220        /* UART1 485 透传使能: 0=关 1=开 */
-#define CFG_OFF_CRC     221        /* CRC-8, 覆盖 [0..220] */
-#define CFG_LEN         222        /* 配置区总长 */
+#define CFG_OFF_CONTENT 16         /* 发射任务: CONTENT(CI₁)[32] */
+#define CFG_OFF_CI2     48         /* 发射任务: CI2[32] (要求从站回传) */
+#define CFG_OFF_ENA     80         /* 发射任务: ENA[32] */
+#define CFG_OFF_PERIODL 112        /* 发射任务: PERIOD_L[32] (u16 小端) */
+#define CFG_OFF_PERIODH 176        /* 发射任务: PERIOD_H[32] (u16 小端) */
+#define CFG_OFF_SELF    240        /* 本机 RF 地址 */
+#define CFG_OFF_PEER    241        /* 对端 RF 地址 */
+#define CFG_OFF_MODE    242        /* 收发模式 (固定 0) */
+#define CFG_OFF_ROLE    243        /* 主从: 0=从机 1=主机 */
+#define CFG_OFF_FREQ_LO 244        /* 载波频率 低16 (Hz) */
+#define CFG_OFF_FREQ_HI 246        /* 载波频率 高16 (Hz) */
+#define CFG_OFF_SF      248        /* 扩频因子 */
+#define CFG_OFF_BW      249        /* 带宽 */
+#define CFG_OFF_CR      250        /* 编码率 */
+#define CFG_OFF_POWER   251        /* 发射功率 */
+#define CFG_OFF_PREAMBLE 252       /* 前导码 */
+#define CFG_OFF_SYNCWORD 253       /* 同步字 */
+#define CFG_OFF_LNA     254        /* LNA 增益 */
+#define CFG_OFF_FE_LO   255        /* 频偏校正值 低字节 */
+#define CFG_OFF_FE_HI   256        /* 频偏校正值 高字节 */
+#define CFG_OFF_FE_EN   257        /* 频偏校正开关 */
+#define CFG_OFF_U1_BDL  258        /* UART1 485 波特率 低字节 */
+#define CFG_OFF_U1_BDH  259        /* UART1 485 波特率 高字节 */
+#define CFG_OFF_U1_BMAX 260        /* UART1 485 缓冲上限 */
+#define CFG_OFF_U1_TOL  261        /* UART1 485 组帧超时 低字节 */
+#define CFG_OFF_U1_TOH  262        /* UART1 485 组帧超时 高字节 */
+#define CFG_OFF_U1_EN   263        /* UART1 485 透传使能 */
+#define CFG_OFF_CRC     264        /* CRC-8, 覆盖 [0..263] */
+#define CFG_LEN         265        /* 配置区总长 */
 
 /* ==================== 射频白名单 ====================
  * 仅这些寄存器会被保存/恢复: LoRa 配置类, 排除只读/状态/FIFO/指针寄存器
@@ -88,9 +98,10 @@ uint8_t config_save(const config_table_t *cfg)
     for (i = 0; i < RF_CFG_N; i++)
         buf[CFG_OFF_RF + i] = cfg->rf_cfg[i];
 
-    /* 发射任务表: CONTENT(32)+ENA(32)+PERIOD_L(64)+PERIOD_H(64), 小端 */
+    /* 发射任务表: CONTENT(CI₁)(32)+CI2(32)+ENA(32)+PERIOD_L(64)+PERIOD_H(64), 小端 */
     for (i = 0; i < 32; i++) {
         buf[CFG_OFF_CONTENT + i]        = cfg->tx_content[i];
+        buf[CFG_OFF_CI2 + i]            = cfg->tx_ci2[i];
         buf[CFG_OFF_ENA + i]            = cfg->tx_ena[i];
         buf[CFG_OFF_PERIODL + i * 2]     = (uint8_t)(cfg->tx_period_l[i] & 0xFF);
         buf[CFG_OFF_PERIODL + i * 2 + 1] = (uint8_t)(cfg->tx_period_l[i] >> 8);
@@ -103,6 +114,19 @@ uint8_t config_save(const config_table_t *cfg)
     buf[CFG_OFF_PEER] = cfg->peer_addr;
     buf[CFG_OFF_MODE] = cfg->rf_mode;
     buf[CFG_OFF_ROLE] = cfg->rf_role;
+
+    /* RF 高层参数: 频率(32bit 小端) + SF/BW/CR/功率/前导/同步/LNA */
+    buf[CFG_OFF_FREQ_LO] = (uint8_t)(cfg->rf_freq & 0xFF);
+    buf[CFG_OFF_FREQ_LO + 1] = (uint8_t)((cfg->rf_freq >> 8) & 0xFF);
+    buf[CFG_OFF_FREQ_HI] = (uint8_t)((cfg->rf_freq >> 16) & 0xFF);
+    buf[CFG_OFF_FREQ_HI + 1] = (uint8_t)((cfg->rf_freq >> 24) & 0xFF);
+    buf[CFG_OFF_SF]      = cfg->rf_sf;
+    buf[CFG_OFF_BW]      = cfg->rf_bw;
+    buf[CFG_OFF_CR]      = cfg->rf_cr;
+    buf[CFG_OFF_POWER]   = cfg->rf_power;
+    buf[CFG_OFF_PREAMBLE]= cfg->rf_preamble;
+    buf[CFG_OFF_SYNCWORD]= cfg->rf_syncword;
+    buf[CFG_OFF_LNA]     = cfg->rf_lna;
 
     /* 频偏校正值(有符号 Hz, 小端) + 校正开关 */
     buf[CFG_OFF_FE_LO] = (uint8_t)(cfg->fe_value & 0xFF);
@@ -117,7 +141,7 @@ uint8_t config_save(const config_table_t *cfg)
     buf[CFG_OFF_U1_TOH]  = (uint8_t)(cfg->uart1_timeout >> 8);
     buf[CFG_OFF_U1_EN]   = cfg->uart1_en;
 
-    /* CRC-8 覆盖 [0..220] */
+    /* CRC-8 覆盖 [0..263] */
     buf[CFG_OFF_CRC] = config_compute_crc(buf, CFG_OFF_CRC);
 
     /* 写入 (内部 unlock/lock; 仅写有变化的字节) */
@@ -146,6 +170,7 @@ uint8_t config_load(config_table_t *cfg)
     /* 解包: 发射任务表 (小端) */
     for (i = 0; i < 32; i++) {
         cfg->tx_content[i]  = buf[CFG_OFF_CONTENT + i];
+        cfg->tx_ci2[i]      = buf[CFG_OFF_CI2 + i];
         cfg->tx_ena[i]      = buf[CFG_OFF_ENA + i];
         cfg->tx_period_l[i] = (uint16_t)buf[CFG_OFF_PERIODL + i * 2]
                             | ((uint16_t)buf[CFG_OFF_PERIODL + i * 2 + 1] << 8);
@@ -158,6 +183,19 @@ uint8_t config_load(config_table_t *cfg)
     cfg->peer_addr = buf[CFG_OFF_PEER];
     cfg->rf_mode   = buf[CFG_OFF_MODE];
     cfg->rf_role   = buf[CFG_OFF_ROLE];
+
+    /* RF 高层参数: 频率(32bit 小端) + SF/BW/CR/功率/前导/同步/LNA */
+    cfg->rf_freq = (uint32_t)buf[CFG_OFF_FREQ_LO]
+                 | ((uint32_t)buf[CFG_OFF_FREQ_LO + 1] << 8)
+                 | ((uint32_t)buf[CFG_OFF_FREQ_HI] << 16)
+                 | ((uint32_t)buf[CFG_OFF_FREQ_HI + 1] << 24);
+    cfg->rf_sf       = buf[CFG_OFF_SF];
+    cfg->rf_bw       = buf[CFG_OFF_BW];
+    cfg->rf_cr       = buf[CFG_OFF_CR];
+    cfg->rf_power    = buf[CFG_OFF_POWER];
+    cfg->rf_preamble = buf[CFG_OFF_PREAMBLE];
+    cfg->rf_syncword = buf[CFG_OFF_SYNCWORD];
+    cfg->rf_lna      = buf[CFG_OFF_LNA];
 
     /* 频偏校正值 + 校正开关 (开关: 非1一律当 0=关, 默认不校正) */
     cfg->fe_value  = (int16_t)((uint16_t)buf[CFG_OFF_FE_LO]

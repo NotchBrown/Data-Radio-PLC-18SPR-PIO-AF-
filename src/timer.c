@@ -2,13 +2,15 @@
  * timer.c - TIM4 系统节拍 + RTC 实现
  * 时钟: 外部无源晶振 HSE 24MHz (需 OPT7 WAITSTATE=1, 见 doc/clock.md)
  *
- * TIM4 12kHz 中断(83.3us)作为最小节拍, 仅供内部标志/累加使用,
- * 不对外提供 us 计数。每 12 次(=1ms, 精确)递增 RTC_MS, 再按秒/分/时/日/月/年进位。
+ * TIM4 6kHz 中断(166.7us)作为最小节拍, 仅供内部标志/累加使用,
+ * 不对外提供 us 计数。每 6 次(=1ms, 精确)递增 RTC_MS, 再按秒/分/时/日/月/年进位。
  *
- * 频率说明: 24MHz / 12000 = 2000 = 2^3 * 250(≤256), 可精确整除!
- *   预分频8 -> 3MHz, ARR=249 -> 周期250 -> 12000Hz 精确, 无偏差
- *   12kHz / 1000 = 12 次/ms 为整数, RTC 走时准确
- *   (16MHz 时同 PSCR/ARR: 16M/8/250=8kHz, TICKS_PER_MS=8)
+ * 频率说明: 24MHz / 6000 = 4000 = 2^3 * 500, 可精确整除!
+ *   预分频8 -> 3MHz, ARR=499 -> 周期500 -> 6000Hz 精确, 无偏差
+ *   6kHz / 1000 = 6 次/ms 为整数, RTC 走时准确
+ *   (16MHz 时同 PSCR/ARR: 16M/8/500=4kHz, TICKS_PER_MS=4)
+ *   降到 6kHz: 减半 TIM4 中断开销, 给 UART3(115200)/UART1(485) 更充足的中断响应
+ *   (DIO0 轮询延迟 83us->167us, RF 事件电平保持足够检测)
  *
  * 注意: 本固件不使用框架 Arduino 的 millis()/micros()/delay()
  *       (框架核心 wiring-millis.c 也定义 TIM4 中断, 若被链接会重复符号;
@@ -19,8 +21,8 @@
 #include "rf.h"
 #include <stm8s.h>
 
-/* 私有: 最小节拍子计数, 每 TICKS_PER_MS 次=1ms (16M/8k=8, 24M/12k=12) */
-#define TICKS_PER_MS  12
+/* 私有: 最小节拍子计数, 每 TICKS_PER_MS 次=1ms (16M/4k=4, 24M/6k=6) */
+#define TICKS_PER_MS  6
 static volatile uint8_t rtc_sub_ms = 0;
 
 /* RTC 全局变量(大写) */
@@ -51,12 +53,12 @@ static uint8_t days_in_month(uint8_t mon, uint8_t year)
  * 使用与 stm8s_it.h 声明一致的处理器名(向量23被其占用, 不能用别的名字) */
 void TIM4_UPD_OVF_IRQHandler(void) __interrupt(ITC_IRQ_TIM4_OVF)
 {
-    /* 12kHz 最小节拍: 内部标志位用 */
-    if (++rtc_sub_ms >= TICKS_PER_MS) {   /* 12次 = 1ms(精确) */
+    /* 6kHz 最小节拍: 每 TICKS_PER_MS 次=1ms */
+    if (++rtc_sub_ms >= TICKS_PER_MS) {   /* 6次 = 1ms(精确) */
         rtc_sub_ms = 0;
+        TICK_MS++;                        /* 毫秒累计 (每1ms+1, uint16 回绕差值正确) */
         if (++RTC_MS >= 1000) {           /* 1s */
             RTC_MS = 0;
-            TICK_MS++;                    /* 毫秒累计 (回绕, 差值正确) */
             if (++RTC_S >= 60) {          /* 1min */
                 RTC_S = 0;
                 if (++RTC_MIN >= 60) {    /* 1h */
@@ -94,9 +96,9 @@ void timer_init(void)
     RTC_MON  = 1;
     RTC_YEAR = 0;
 
-    /* 预分频8 -> 3MHz; ARR=249 -> 周期250 -> 12000Hz 精确(83us) @24MHz */
+    /* 预分频8 -> 3MHz; ARR=499 -> 周期500 -> 6000Hz 精确(167us) @24MHz */
     TIM4->PSCR = (uint8_t)TIM4_PRESCALER_8;
-    TIM4->ARR  = 249;
+    TIM4->ARR  = 499;
     /* 清更新标志 */
     TIM4->SR1  = (uint8_t)(~TIM4_IT_UPDATE);
     /* 使能更新中断 */

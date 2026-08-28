@@ -1,10 +1,14 @@
 #include <Arduino.h>
 #include "timer.h"
 #include "spi.h"
+#include "rf.h"
+#include "rf_app.h"
 #include "dio.h"
 #include "adc.h"
 #include "dac.h"
 #include "uart3.h"
+#include "uart1.h"
+#include "dbg.h"
 #include "mode1.h"
 #include "mode2.h"
 #include "mode3.h"
@@ -72,12 +76,20 @@ void setup()
     clock_init();    /* 1. 16MHz HSI        */
     timer_init();    /* 2. TIM4 1ms 节拍中断 */
     spi_init();      /* 3. SPI 主控 + 软件NSS(见 spi.c) */
-    dio_init();      /* 4. DI/DO 初始化      */
-    adc_init();      /* 5. ADC2 10bit        */
-    dac_init();      /* 6. AD5314 SPI        */
-    led_sw_init();   /* 7. LED + 拨码        */
-    uart3_init();    /* 8. UART3 工作模式    */
-    uart3_send_id(); /* 9. 上电上报 MCU ID 帧 */
+    rf_init();       /* 4. RA-01 SX1278 LoRa 初始化 (依赖 SPI) */
+    rf_app_init();   /* 5. RF 应用层状态复位 */
+    dio_init();      /* 6. DI/DO 初始化      */
+    adc_init();      /* 7. ADC2 10bit        */
+    dac_init();      /* 8. AD5314 SPI        */
+    led_sw_init();   /* 9. LED + 拨码        */
+    uart3_init();    /* 10. UART3 工作模式   */
+    dbg_init();      /* 10.5 调试打印就绪 (仅 RF_DEBUG 构建的调用点打印) */
+    DBG_STR("[D]DBG boot pos="); DBG_DEC(dbg_pos_get()); DBG_NL();   /* 打印卡死位置码 */
+    DBG_POS(0);   /* 清卡死位置码 */
+    uart3_config_restore(); /* 11. 上电恢复 EEPROM 配置 (射频/任务/地址/485) */
+    rf_apply_config();      /* 11.5 按恢复后的 RF 参数重新配置 SX1278 (频率/SF/BW/CR等) */
+    uart1_init();    /* 12. UART1 RS-485 (用恢复后的波特率) */
+    uart3_send_id(); /* 13. 上电上报 MCU ID 帧 */
 }
 
 /* ------------------------------------------------------------------
@@ -92,6 +104,8 @@ void loop()
 {
     uint8_t dbg, run, mode;
 
+    uart3_dbg_poll();   /* 诊断: 任意模式打印 UART3 收到的原始字节 */
+
     /* 1. 先读拨码 (同周期内保持一致) */
     dbg = SW_DEBUG_ON();
     run = SW_RUN_ON();
@@ -105,10 +119,10 @@ void loop()
 
     /* 4. switch 跳转到对应模式的周期性子程序 */
     switch (mode) {
-    case 1: mode1_run(); break;   /* 只读配置   */
-    case 2: mode2_run(); break;   /* 读写配置   */
-    case 3: mode3_run(); break;   /* 远程发射   */
-    case 4: mode4_run(); break;   /* 本机直通   */
+    case 1: uart1_enable(0);       mode1_run(); break;   /* 只读配置   */
+    case 2: uart1_enable(0);       mode2_run(); break;   /* 读写配置   */
+    case 3: uart1_enable(UART1_EN);mode3_run(); break;   /* 远程发射+485透传 */
+    case 4: uart1_enable(0);       mode4_run(); break;   /* 本机直通   */
     }
 }
 

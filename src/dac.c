@@ -32,13 +32,14 @@ static void dac_write_channel(uint8_t ch, uint8_t val_h, uint8_t val_l)
     cmd = ((uint16_t)ch << 14) | 0x2000 | ((val & 0x3FF) << 2);
 
     /* 选从机(配Mode2 + 拉低SYNC) -> 发16bit -> 释放(拉高SYNC)
-     * 置 RF_SPI_BUSY: TIM4 RF 轮询让路, 保证 SPI 时序不乱 + 不丢 RF 数据 */
-    RF_SPI_BUSY = 1;
+     * RF_SPI_BUSY 计数占用: TIM4 RF 轮询让路, 保证 SPI 时序不乱 + 不丢 RF 数据
+     * (write_dac_all 多通道连续, 防 ISR 插入) */
+    RF_SPI_BUSY++;
     spi_begin(SPI_SLAVE_DAC);
     spi_transfer((cmd >> 8) & 0xFF);
     spi_transfer(cmd & 0xFF);
     spi_end(SPI_SLAVE_DAC);
-    RF_SPI_BUSY = 0;
+    RF_SPI_BUSY--;
 }
 
 /* ==================== 初始化 ==================== */
