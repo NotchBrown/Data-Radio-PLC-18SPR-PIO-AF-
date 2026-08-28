@@ -17,6 +17,7 @@
 #include "uart3.h"
 #include "rf.h"
 #include "timer.h"
+#include "dbg.h"
 #include <Arduino.h>
 #include <stm8s.h>
 
@@ -84,6 +85,13 @@ void UART1_RX_IRQHandler(void) __interrupt(ITC_IRQ_UART1_RX)
     UART1_RX_LAST_MS = rtc_get_ms();
 }
 
+/* ==================== UART1 发送中断 (向量17) ====================
+ * 未使用 (485 发送为轮询 + CTRL 方向控制), 空实现满足中断向量表
+ */
+void UART1_TX_IRQHandler(void) __interrupt(ITC_IRQ_UART1_TX)
+{
+}
+
 /* ==================== 主循环: 485 上行透传 ====================
  * 触发条件: 缓冲有数据 且 (缓冲满 或 距上次收字节 > 组帧超时)
  * 组 485 帧 (doc/frame.md): [地址][0x37][1 L][数据×L] -> rf_tx_start
@@ -96,6 +104,7 @@ void uart1_poll(void)
 
     if (!UART1_ENABLED) return;
     if (UART1_RX_LEN == 0) return;
+    if (RF_TX_BUSY) return;   /* RF 忙: 保留数据下一轮再发, 不丢 */
 
     bmax = UART1_BUF_MAX;
     if (bmax == 0 || bmax > UART1_BUF_SIZE) bmax = 64;
@@ -116,6 +125,7 @@ void uart1_poll(void)
     fbuf[0] = UART3_PEER_ADDR;
     fbuf[1] = 0x37;                          /* 定位头|内容指示=1 */
     fbuf[2] = (uint8_t)(0x80 | (len & 0x7F));
+    DBG_STR("[D]485tx len="); DBG_DEC(len); DBG_NL();
     rf_tx_start(fbuf, (uint8_t)(len + 3));
 }
 
@@ -125,11 +135,20 @@ void uart1_poll(void)
 void uart1_send(const uint8_t *data, uint8_t len)
 {
     uint8_t i;
+    uint16_t guard = 0;
     if (!UART1_ENABLED || len == 0) return;
 
     UART1_CTRL_TX();
-    for (i = 0; i < len; i++)
+    for (i = 0; i < len; i++) {
+        guard = 0;
+        while (UART1_GetFlagStatus(UART1_FLAG_TXE) == RESET) {   /* 等 TXE */
+            if (++guard > 2000) { UART1_CTRL_RX(); return; }
+        }
         UART1_SendData8(data[i]);
-    while (UART1_GetFlagStatus(UART1_FLAG_TC) == RESET);   /* 等发送完成 */
+    }
+    guard = 0;
+    while (UART1_GetFlagStatus(UART1_FLAG_TC) == RESET) {   /* 等发送完成 */
+        if (++guard > 2000) break;
+    }
     UART1_CTRL_RX();
 }

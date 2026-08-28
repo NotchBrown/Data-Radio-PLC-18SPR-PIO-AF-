@@ -13,6 +13,9 @@
 #include "adc.h"
 #include "dac.h"
 #include "rf.h"
+#include "rf_app.h"
+#include "config.h"
+#include "dbg.h"
 #include <Arduino.h>
 #include <stm8s.h>
 
@@ -37,6 +40,10 @@
 #define TX_PARAM_PERIOD_L  2   /* 执行周期 低16bit */
 #define TX_PARAM_PERIOD_H  3   /* 执行周期 高16bit */
 
+/* 命令地址 (doc/upperpc.md) */
+#define UART3_CMD_SAVE   0x1E  /* 写触发: 保存配置到 EEPROM */
+#define UART3_CMD_CLEAR  0x1F  /* 写触发: 恢复出厂(清配置区) */
+
 /* ==================== 全局变量 (Page0) ==================== */
 static volatile uint8_t  UART3_STATE;    /* 状态机 */
 static volatile uint8_t  UART3_HEAD;     /* 定位头 */
@@ -49,12 +56,48 @@ static volatile uint8_t  UART3_RX_OK;    /* 完整帧标志 */
 static volatile uint8_t  UART3_WRITE_EN; /* 0=只读(拦截写), 1=允许读写 */
 static volatile uint16_t UART3_LAST_MS;  /* 最近收字节时刻 (超时用) */
 
-/* 发射流程任务表 (32任务) */
-static uint8_t  UART3_TX_CONTENT[32];
-static uint8_t  UART3_TX_ENA[32];
-static uint16_t UART3_TX_PERIOD_L[32];
-static uint16_t UART3_TX_PERIOD_H[32];
-static uint16_t UART3_TX_LAST[32];   /* 各任务上次发射时刻(ms) */
+/* RX 回显诊断缓冲 (仅 RF_DEBUG): ISR 存收到的原始字节, 主循环打印,
+ * 用于确认 UART3 是否真的收到上位机配置帧 (排查配置无响应) */
+#ifdef RF_DEBUG
+#define UART3_RX_ECHO_MAX 24
+static volatile uint8_t  UART3_RX_ECHO[UART3_RX_ECHO_MAX];
+static volatile uint8_t  UART3_RX_ECHO_N;
+#endif
+
+/* RF 网络运行配置 (UART3 读写, 存 EEPROM, 供 rf_app 使用; 上电恢复覆盖) */
+uint8_t UART3_SELF_ADDR = 0x01;   /* 本机 RF 地址 */
+uint8_t UART3_PEER_ADDR = 0x02;   /* 对端 RF 地址 */
+uint8_t UART3_RF_MODE   = 0;      /* 收发模式: 固定 0 (统一异步主从, 0x18) */
+uint8_t UART3_RF_ROLE   = 0;      /* 主从: 0=从机 1=主机 (0x19) */
+
+/* 频偏校正 (doc/upperpc.md 0x26~0x28): 单位 Hz, 开关默认 0=关 */
+int16_t UART3_FE_VALUE  = 0;      /* 校正值 (Hz, 0x27, 存 EEPROM) */
+uint8_t UART3_FE_EN     = 0;      /* 校正开关: 0=关(默认) 1=开 (0x28, 存 EEPROM) */
+uint8_t UART3_FE_STATUS = 0;      /* 校正状态: 0未 1成功 2失败 3校正中 (0x26) */
+
+/* UART1 485 透传配置 (doc/upperpc.md 0x1A~0x1D, 存 EEPROM) */
+uint16_t UART1_BAUD     = 9600;   /* 485 波特率 */
+uint8_t  UART1_BUF_MAX  = 64;     /* 485 接收缓冲上限 (1~127) */
+uint16_t UART1_TIMEOUT  = 5;      /* 485 组帧超时 (ms) */
+uint8_t  UART1_EN       = 0;      /* 485 透传使能: 0=关(默认) 1=开 */
+
+/* 发射流程任务表 (32任务); 由 rf_app 读取做发送调度 */
+uint8_t  UART3_TX_CONTENT[32];    /* CI₁: 主站→从站内容指示 */
+uint8_t  UART3_TX_CI2[32];        /* CI₂: 要求从站回传内容指示 (0x40~0x5F) */
+uint8_t  UART3_TX_ENA[32];
+uint16_t UART3_TX_PERIOD_L[32];
+uint16_t UART3_TX_PERIOD_H[32];
+static uint16_t UART3_TX_LAST[32];   /* 各任务上次发射时刻(ms) (uart3_tx_run 用) */
+
+/* RF 高层参数 (doc/upperpc.md 0x30~0x38; 存 EEPROM, 上电按此配 SX1278) */
+uint32_t UART3_RF_FREQ     = CFG_DFLT_FREQ;
+uint8_t  UART3_RF_SF       = CFG_DFLT_SF;
+uint8_t  UART3_RF_BW       = CFG_DFLT_BW;
+uint8_t  UART3_RF_CR       = CFG_DFLT_CR;
+uint8_t  UART3_RF_POWER    = CFG_DFLT_POWER;
+uint8_t  UART3_RF_PREAMBLE = CFG_DFLT_PREAMBLE;
+uint8_t  UART3_RF_SYNCWORD = CFG_DFLT_SYNCWORD;
+uint8_t  UART3_RF_LNA      = CFG_DFLT_LNA;
 
 /* ==================== CRC-8 (poly 0x07, init 0x00) ==================== */
 static uint8_t uart3_crc8(uint8_t crc, uint8_t byte)
@@ -120,13 +163,48 @@ static uint16_t uart3_read_addr(uint8_t addr)
     case 0x13: return (uint16_t)((PORT_DO1_H << 2) | (PORT_DO1_L >> 6));
     case 0x14: return (uint16_t)((PORT_DO2_H << 2) | (PORT_DO2_L >> 6));
     case 0x15: return (uint16_t)((PORT_DO3_H << 2) | (PORT_DO3_L >> 6));
+    case 0x16: return UART3_SELF_ADDR;
+    case 0x17: return UART3_PEER_ADDR;
+    case 0x18: return 0;                       /* 固定 0 (统一异步主从) */
+    case 0x19: return UART3_RF_ROLE;
+    /* RF 高层参数 (0x30~0x38) */
+    case 0x30: return (uint16_t)(UART3_RF_FREQ & 0xFFFF);            /* 频率低16 */
+    case 0x31: return (uint16_t)((UART3_RF_FREQ >> 16) & 0xFFFF);    /* 频率高16 */
+    case 0x32: return UART3_RF_SF;
+    case 0x33: return UART3_RF_BW;
+    case 0x34: return UART3_RF_CR;
+    case 0x35: return UART3_RF_POWER;
+    case 0x36: return UART3_RF_PREAMBLE;
+    case 0x37: return UART3_RF_SYNCWORD;
+    case 0x38: return UART3_RF_LNA;
+    /* UART1 485 透传配置 (0x1A~0x1D) */
+    case 0x1A: return UART1_BAUD;       /* 485 波特率 */
+    case 0x1B: return UART1_BUF_MAX;    /* 485 缓冲上限 */
+    case 0x1C: return UART1_TIMEOUT;    /* 485 组帧超时 */
+    case 0x1D: return UART1_EN;         /* 485 透传使能 */
+    case 0x1E: return config_valid() ? 0x0001 : 0x0000;  /* 配置区有效性 */
+    case 0x1F: return 0x0000;                            /* 保留 */
+    /* 控制指令 (0x20~0x28, 见 doc/upperpc.md) */
+    case 0x20: return 0x0000;                            /* RF 发送测试 (写触发) */
+    case 0x21: return RF_APP_RX_CNT;                     /* 收到帧计数 */
+    case 0x22: return RF_APP_CRC_CNT;                    /* CRC 错计数 */
+    case 0x23: return RF_APP_OVERFLOW;                   /* 发送溢出计数 */
+    case 0x24: return (uint16_t)(int16_t)RF_LAST_RSSI;   /* 最近 RSSI (有符号 dBm) */
+    case 0x25: return (uint16_t)(int16_t)RF_LAST_SNR;    /* 最近 SNR (有符号 dB) */
+    case 0x26: return UART3_FE_STATUS;                   /* 校正状态 */
+    case 0x27: return (uint16_t)UART3_FE_VALUE;          /* 校正值 (Hz, 有符号) */
+    case 0x28: return UART3_FE_EN;                       /* 校正开关 */
     }
-    if (addr >= 0x40 && addr <= 0x7F)   /* 射频设置: SX1278 寄存器 */
-        return rf_read_reg(addr & 0x3F);
+    if (addr >= 0x40 && addr <= 0x5F)   /* CI₂[32]: 要求从站回传内容指示 */
+        return UART3_TX_CI2[addr - 0x40];
+    if (addr >= 0x60 && addr <= 0x7F)   /* 射频设置(调试): SX1278 寄存器直写 */
+        return rf_read_reg(addr & 0x1F);
     if (addr >= 0x80)                   /* 发射流程设置 */
         return uart3_tx_read(addr);
     return 0;
 }
+
+static uint8_t uart3_cmd_save(void);   /* 前向声明 (定义在下方) */
 
 /* ==================== 地址写 (返回设定后值) ==================== */
 static uint16_t uart3_write_addr(uint8_t addr, uint16_t val)
@@ -153,14 +231,128 @@ static uint16_t uart3_write_addr(uint8_t addr, uint16_t val)
     case 0x15: PORT_DO3_H = (uint8_t)(val >> 2);
                PORT_DO3_L = (uint8_t)((val << 6) & 0xFF); write_dac_ao3();
                return (uint16_t)((PORT_DO3_H << 2) | (PORT_DO3_L >> 6));
+    case 0x16: UART3_SELF_ADDR = (uint8_t)val; return UART3_SELF_ADDR;
+    case 0x17: UART3_PEER_ADDR = (uint8_t)val; return UART3_PEER_ADDR;
+    case 0x18: return 0;                       /* 固定 0 (忽略写入) */
+    case 0x19: UART3_RF_ROLE   = (uint8_t)val; return UART3_RF_ROLE;
+    /* RF 高层参数 (0x30~0x38) */
+    case 0x30: UART3_RF_FREQ = (UART3_RF_FREQ & 0xFFFF0000UL) | (val & 0xFFFF);
+               return (uint16_t)(UART3_RF_FREQ & 0xFFFF);
+    case 0x31: UART3_RF_FREQ = (UART3_RF_FREQ & 0x0000FFFFUL) | ((uint32_t)val << 16);
+               return (uint16_t)((UART3_RF_FREQ >> 16) & 0xFFFF);
+    case 0x32: UART3_RF_SF = (uint8_t)val; return UART3_RF_SF;
+    case 0x33: UART3_RF_BW = (uint8_t)val; return UART3_RF_BW;
+    case 0x34: UART3_RF_CR = (uint8_t)val; return UART3_RF_CR;
+    case 0x35: UART3_RF_POWER = (uint8_t)val; return UART3_RF_POWER;
+    case 0x36: UART3_RF_PREAMBLE = (uint8_t)val; return UART3_RF_PREAMBLE;
+    case 0x37: UART3_RF_SYNCWORD = (uint8_t)val; return UART3_RF_SYNCWORD;
+    case 0x38: UART3_RF_LNA = (uint8_t)val; return UART3_RF_LNA;
+    /* UART1 485 透传配置 (0x1A~0x1D) */
+    case 0x1A: UART1_BAUD     = val;          return UART1_BAUD;
+    case 0x1B: UART1_BUF_MAX  = (uint8_t)val; return UART1_BUF_MAX;
+    case 0x1C: UART1_TIMEOUT  = val;          return UART1_TIMEOUT;
+    case 0x1D: UART1_EN       = (val) ? 1 : 0; return UART1_EN;
+    case 0x1E:                                          /* 保存配置 */
+        if (val == 0x0001)
+            return uart3_cmd_save() ? 0x0001 : 0x0000;
+        return 0x0000;
+    case 0x1F:                                          /* 恢复出厂 */
+        if (val == 0x0001) { config_clear(); return 0x0001; }
+        return 0x0000;
+    /* 控制指令 (0x20~0x28, 见 doc/upperpc.md) */
+    case 0x20:                                          /* RF 发送测试 */
+        if (val == 0x0001) rf_app_test_tx();
+        return 0x0000;
+    case 0x21: if (val == 0) RF_APP_RX_CNT = 0;  return RF_APP_RX_CNT;  /* 清零 */
+    case 0x22: if (val == 0) RF_APP_CRC_CNT = 0; return RF_APP_CRC_CNT;
+    case 0x23: if (val == 0) RF_APP_OVERFLOW = 0;return RF_APP_OVERFLOW;
+    case 0x26:                                          /* 频偏校正触发 */
+        if (val == 0x0001) {
+            if (!UART3_FE_EN) return 0;   /* 校正开关关闭: 不校正 */
+            UART3_FE_STATUS = 3;          /* 校正中 */
+            RF_APP_FE_REQUEST = 1;        /* rf_app_run 执行 */
+            return 0;
+        }
+        return UART3_FE_STATUS;
+    case 0x27: UART3_FE_VALUE = (int16_t)val; return (uint16_t)UART3_FE_VALUE;
+    case 0x28: UART3_FE_EN = (val) ? 1 : 0; return UART3_FE_EN;
     }
-    if (addr >= 0x40 && addr <= 0x7F) {
-        rf_write_reg(addr & 0x3F, (uint8_t)val);
-        return rf_read_reg(addr & 0x3F);
+    if (addr >= 0x40 && addr <= 0x5F) {   /* CI₂[32]: 要求从站回传内容指示 */
+        UART3_TX_CI2[addr - 0x40] = (uint8_t)val;
+        return UART3_TX_CI2[addr - 0x40];
+    }
+    if (addr >= 0x60 && addr <= 0x7F) {   /* 射频设置(调试): SX1278 寄存器直写 */
+        rf_write_reg(addr & 0x1F, (uint8_t)val);
+        return rf_read_reg(addr & 0x1F);
     }
     if (addr >= 0x80)
         return uart3_tx_write(addr, val);
     return 0;   /* 只读地址写入返回 0 */
+}
+
+/* ==================== 命令: 保存配置到 EEPROM ====================
+ * 组快照: 射频白名单读当前值 + 发射任务表;
+ * 保存期间关 UART3 RX 中断 (EEPROM 逐字节编程约数百 ms, 上位机应等回复)
+ */
+static uint8_t uart3_cmd_save(void)
+{
+    config_table_t cfg;
+    uint8_t i, ok;
+
+    /* 射频白名单: 读 SX1278 当前寄存器值 */
+    for (i = 0; i < RF_CFG_N; i++)
+        cfg.rf_cfg[i] = rf_read_reg(RF_CFG_REGS[i]);
+
+    /* 发射任务表: 当前运行配置 */
+    for (i = 0; i < 32; i++) {
+        cfg.tx_content[i]  = UART3_TX_CONTENT[i];
+        cfg.tx_ci2[i]      = UART3_TX_CI2[i];
+        cfg.tx_ena[i]      = UART3_TX_ENA[i];
+        cfg.tx_period_l[i] = UART3_TX_PERIOD_L[i];
+        cfg.tx_period_h[i] = UART3_TX_PERIOD_H[i];
+    }
+
+    /* 本机/对端地址 + 收发模式(固定0) + 主从位 */
+    cfg.self_addr = UART3_SELF_ADDR;
+    cfg.peer_addr = UART3_PEER_ADDR;
+    cfg.rf_mode   = 0;
+    cfg.rf_role   = UART3_RF_ROLE;
+
+    /* RF 高层参数 */
+    cfg.rf_freq     = UART3_RF_FREQ;
+    cfg.rf_sf       = UART3_RF_SF;
+    cfg.rf_bw       = UART3_RF_BW;
+    cfg.rf_cr       = UART3_RF_CR;
+    cfg.rf_power    = UART3_RF_POWER;
+    cfg.rf_preamble = UART3_RF_PREAMBLE;
+    cfg.rf_syncword = UART3_RF_SYNCWORD;
+    cfg.rf_lna      = UART3_RF_LNA;
+
+    /* 频偏校正值 + 校正开关 */
+    cfg.fe_value  = UART3_FE_VALUE;
+    cfg.fe_enable = UART3_FE_EN;
+
+    /* UART1 485 配置 */
+    cfg.uart1_baud    = UART1_BAUD;
+    cfg.uart1_buf_max = UART1_BUF_MAX;
+    cfg.uart1_timeout = UART1_TIMEOUT;
+    cfg.uart1_en      = UART1_EN;
+
+    /* 保存期间关 UART3 RX 中断, 避免收帧被打断 */
+    UART3_ITConfig(UART3_IT_RXNE, DISABLE);
+    ok = config_save(&cfg);
+    UART3_ITConfig(UART3_IT_RXNE, ENABLE);
+    return ok;
+}
+
+/* 发送一字节 (带超时保护, 防 UART3 异常死循环) */
+static void uart3_putc(uint8_t c)
+{
+    uint16_t guard = 0;
+    while (!(UART3->SR & 0x80)) {   /* 等 TXE */
+        if (++guard > 2000) return;
+    }
+    UART3->DR = c;
 }
 
 /* ==================== 回复一帧 (对称帧, 数据小端) ==================== */
@@ -174,18 +366,12 @@ static void uart3_reply(uint8_t head, uint8_t addr, uint16_t val)
     tail = (uint8_t)~head;
 
     /* 发送 (ISR 不碰 TX, 无需关整个包; 仅保 TXE 轮询) */
-    while (!(UART3->SR & 0x80));  /* 等 TXE */
-    UART3->DR = head;
-    while (!(UART3->SR & 0x80));
-    UART3->DR = addr;
-    while (!(UART3->SR & 0x80));
-    UART3->DR = (uint8_t)(val & 0xFF);
-    while (!(UART3->SR & 0x80));
-    UART3->DR = (uint8_t)(val >> 8);
-    while (!(UART3->SR & 0x80));
-    UART3->DR = crc;
-    while (!(UART3->SR & 0x80));
-    UART3->DR = tail;
+    uart3_putc(head);
+    uart3_putc(addr);
+    uart3_putc((uint8_t)(val & 0xFF));
+    uart3_putc((uint8_t)(val >> 8));
+    uart3_putc(crc);
+    uart3_putc(tail);
 }
 
 /* ==================== 初始化 ==================== */
@@ -261,6 +447,72 @@ void uart3_tx_run(void)
     }
 }
 
+/* ==================== 上电恢复配置 ====================
+ * 读 EEPROM 校验通过则回填: 射频白名单(SX1278) + 任务表 + 地址/模式
+ * 需在 rf_init() 之后调用 (setup 末尾)
+ */
+void uart3_config_restore(void)
+{
+    config_table_t cfg;
+    uint8_t i;
+
+    if (!config_load(&cfg)) return;   /* 无效/未保存: 用固件默认值 */
+
+    /* 射频白名单回填 SX1278 */
+    for (i = 0; i < RF_CFG_N; i++)
+        rf_write_reg(RF_CFG_REGS[i], cfg.rf_cfg[i]);
+
+    /* 发射任务表 */
+    for (i = 0; i < 32; i++) {
+        UART3_TX_CONTENT[i]  = cfg.tx_content[i];
+        UART3_TX_CI2[i]      = cfg.tx_ci2[i];
+        UART3_TX_ENA[i]      = cfg.tx_ena[i];
+        UART3_TX_PERIOD_L[i] = cfg.tx_period_l[i];
+        UART3_TX_PERIOD_H[i] = cfg.tx_period_h[i];
+    }
+
+    /* 本机/对端地址 + 收发模式(固定0) + 主从位 */
+    UART3_SELF_ADDR = cfg.self_addr;
+    UART3_PEER_ADDR = cfg.peer_addr;
+    UART3_RF_MODE   = 0;
+    UART3_RF_ROLE   = cfg.rf_role;
+
+    /* RF 高层参数 */
+    UART3_RF_FREQ     = cfg.rf_freq;
+    UART3_RF_SF       = cfg.rf_sf;
+    UART3_RF_BW       = cfg.rf_bw;
+    UART3_RF_CR       = cfg.rf_cr;
+    UART3_RF_POWER    = cfg.rf_power;
+    UART3_RF_PREAMBLE = cfg.rf_preamble;
+    UART3_RF_SYNCWORD = cfg.rf_syncword;
+    UART3_RF_LNA      = cfg.rf_lna;
+
+    /* 频偏校正值 + 校正开关 */
+    UART3_FE_VALUE  = cfg.fe_value;
+    UART3_FE_EN     = cfg.fe_enable;
+
+    /* UART1 485 配置 */
+    UART1_BAUD     = cfg.uart1_baud;
+    UART1_BUF_MAX  = cfg.uart1_buf_max;
+    UART1_TIMEOUT  = cfg.uart1_timeout;
+    UART1_EN       = cfg.uart1_en;
+}
+
+/* 调试: 任意模式打印 UART3 收到的原始字节 (仅 RF_DEBUG)
+ * 放主循环(非 process), 这样即使板子在模式3(process 不调用)也能看到是否收到字节 */
+#ifdef RF_DEBUG
+void uart3_dbg_poll(void)
+{
+    if (UART3_RX_ECHO_N) {
+        uint8_t en, i;
+        __critical { en = UART3_RX_ECHO_N; UART3_RX_ECHO_N = 0; }
+        DBG_STR("[D]rx:");
+        for (i = 0; i < en; i++) { DBG_STR(" "); DBG_HEX8(UART3_RX_ECHO[i]); }
+        DBG_NL();
+    }
+}
+#endif
+
 /* ==================== 主循环处理 ==================== */
 void uart3_process(void)
 {
@@ -305,6 +557,11 @@ void UART3_RX_IRQHandler(void) __interrupt(ITC_IRQ_UART3_RX)
     uint8_t b = UART3->DR;   /* 读数据并清 RXNE */
 
     UART3_LAST_MS = rtc_get_ms();
+
+#ifdef RF_DEBUG
+    if (UART3_RX_ECHO_N < UART3_RX_ECHO_MAX)
+        UART3_RX_ECHO[UART3_RX_ECHO_N++] = b;   /* 存收到的原始字节 */
+#endif
 
     switch (UART3_STATE) {
     case ST_IDLE:
