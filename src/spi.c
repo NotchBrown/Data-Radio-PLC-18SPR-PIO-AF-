@@ -10,6 +10,8 @@
  * SCK = fMASTER / BR, BR 仅 2 的幂分频 (/2~/256)
  */
 #include "spi.h"
+#include "rf.h"
+#include "dbg.h"
 #include <Arduino.h>
 #include <stm8s.h>
 
@@ -50,6 +52,7 @@ void spi_begin(spi_slave_t slave)
     }
 
     __critical {
+        RF_SPI_BUSY++;   /* 占用 SPI (原子置位, 防 ISR 打断复用总线) */
         /* 配 Mode/速率 (保留 MSTR/SPE/LSBFIRST) */
         SPI->CR1 = (SPI->CR1 & ~SPI_CFG_MASK) | cfg;
 
@@ -65,20 +68,32 @@ void spi_begin(spi_slave_t slave)
 
 void spi_end(spi_slave_t slave)
 {
-    switch (slave) {
-    case SPI_SLAVE_DAC:   GPIOH->ODR |= 0x80; break;  /* PH7 */
-    case SPI_SLAVE_RF:    GPIOH->ODR |= 0x40; break;  /* PH6 */
-    case SPI_SLAVE_FLASH:
-    default:              GPIOF->ODR |= 0x01; break;  /* PF0 */
+    __critical {
+        switch (slave) {
+        case SPI_SLAVE_DAC:   GPIOH->ODR |= 0x80; break;  /* PH7 */
+        case SPI_SLAVE_RF:    GPIOH->ODR |= 0x40; break;  /* PH6 */
+        case SPI_SLAVE_FLASH:
+        default:              GPIOF->ODR |= 0x01; break;  /* PF0 */
+        }
+        if (RF_SPI_BUSY) RF_SPI_BUSY--;   /* 释放 SPI (原子) */
     }
 }
 
 /* ==================== 收发 ==================== */
 uint8_t spi_transfer(uint8_t byte)
 {
-    while (!(SPI->SR & 0x02));   /* 等 TXE=1 可写 */
+    uint16_t guard = 0;
+    while (!(SPI->SR & 0x02)) {   /* 等 TXE=1 可写 */
+        if (++guard > 2000) {
+            DBG_STR("[D]SPI_TXE_to\r\n");   /* SPI 异常: 诊断 */
+            break;
+        }
+    }
     SPI->DR = byte;
-    while (!(SPI->SR & 0x01));   /* 等 RXNE=1 有数据 */
+    guard = 0;
+    while (!(SPI->SR & 0x01)) {   /* 等 RXNE=1 有数据 */
+        if (++guard > 2000) break;
+    }
     return SPI->DR;
 }
 
@@ -87,9 +102,15 @@ void spi_transfer_n(const uint8_t *tx, uint8_t *rx, uint16_t n)
     uint16_t i;
     for (i = 0; i < n; i++) {
         uint8_t out = tx ? tx[i] : 0xFF;
-        while (!(SPI->SR & 0x02));
+        uint16_t guard = 0;
+        while (!(SPI->SR & 0x02)) {
+            if (++guard > 2000) break;
+        }
         SPI->DR = out;
-        while (!(SPI->SR & 0x01));
+        guard = 0;
+        while (!(SPI->SR & 0x01)) {
+            if (++guard > 2000) break;
+        }
         if (rx) rx[i] = SPI->DR;
     }
 }
