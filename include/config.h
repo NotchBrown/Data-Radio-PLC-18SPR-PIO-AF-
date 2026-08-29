@@ -15,7 +15,7 @@
 #define CFG_VERSION 0x06
 
 /* 射频可持久化寄存器白名单数量 */
-#define RF_CFG_N    14
+#define RF_CFG_N    13
 
 /* 配置表快照 (与 EEPROM 布局对应, 见 doc/upperpc.md) */
 typedef struct {
