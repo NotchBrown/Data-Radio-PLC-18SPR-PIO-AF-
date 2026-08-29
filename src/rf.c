@@ -231,6 +231,17 @@ void rf_apply_config(void)
 
     /* 进 RXCONT (含 I/Q 极性 + ERRATA 2.3 + mask) */
     rf_rx_start();
+    RF_ENABLED = 1;              /* 唤醒: 允许 TIM4 rf_poll 接管收发 */
+}
+
+/* ==================== RF 休眠/唤醒 (模式切换用) ====================
+ * rf_sleep(): 进 STDBY, 停止 RF 收发 (省电+彻底静默; 模式1/4 用)
+ * 唤醒: 直接调用 rf_apply_config() 重新进 RXCONT (模式2/3 用)
+ */
+void rf_sleep(void)
+{
+    RF_ENABLED = 0;              /* 让 TIM4 rf_poll 让路, 不再收发 */
+    rf_set_opmode(OPMODE_STDBY); /* STDBY: 停止 RF, 保留 LoRa 配置 */
 }
 
 /* ==================== 初始化 ==================== */
@@ -355,7 +366,7 @@ void rf_abort_tx(void)
 }
 
 /* ==================== TIM4 ISR 轮询 ====================
- * 由 timer.c 的 TIM4 中断每 83us 调用一次:
+ * 由 timer.c 的 TIM4 中断每 167us 调用一次:
  *   平时只读 DIO0 电平, 无事件则立即返回 (开销极小);
  *   有事件才做 SPI 读 + 收包入缓冲 + 清忙。
  * 半双工: 处理完回 RXCONT (接收常态)。

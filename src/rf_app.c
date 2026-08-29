@@ -2,11 +2,9 @@
  * rf_app.c - RF 应用层实现
  *
  * 帧协议 (doc/frame.md): [定位头(7bit)+指示字(1bit)][地址][内容指示][数据...]
- * 4 模式 (doc/upperpc.md 0x18):
- *   1 同步发送(单工): 发送表[0] 内容指示 + 周期 采集成帧发送
- *   2 异步接收(单工): 静默接收, 解帧更新输出
- *   3 异步收发(半双工): 收到一帧应答一帧
- *   4 定时发送+异步接收: 遍历发送表周期发送
+ * 统一异步主从 (doc/upperpc.md 0x19 主从位, 与拨码无关):
+ *   主机: 按发射表周期发帧(CI₁ 本机内容 + CI₂ 要求从站回传内容), 等回包超时重传, 连续失败回握手
+ *   从机: 收到主站帧, 按主站要求的 CI₂ 回传本机数据(1 个 CI)
  * 接收: rf.c TIM4 轮询收原始帧 -> rf_app_rx_isr (ISR) 解包更新输出内存,
  *       主循环 rf_app_run 把输出内存同步到硬件(GPIO/SPI)。
  */
@@ -42,12 +40,6 @@
 #define CI_WORDLEN  0x02
 #define CI_COMPRESS 0x01
 
-/* 收发模式 (doc/upperpc.md 0x18) */
-#define RF_MODE_SYNC_TX    1   /* 同步发送(单工) */
-#define RF_MODE_ASYNC_RX   2   /* 异步接收(单工) */
-#define RF_MODE_ASYNC_TXRX 3   /* 异步收发(半双工) */
-#define RF_MODE_TIMED_TX   4   /* 定时发送+异步接收 */
-
 /* SYSTEM_LED = PH1 (高电平点亮) */
 #define RF_LED_SYS_ON()  (GPIOH->ODR |= 0x02)
 #define RF_LED_SYS_OFF() (GPIOH->ODR &= (uint8_t)~0x02)
@@ -62,6 +54,7 @@
  * 主机主动发起, 回包驱动刷新; 等回包超时重发; 连续失败回握手 */
 #define RF_M3_RETRY_TIMEOUT_MS 500   /* 等回包超时(重发间隔) ms */
 #define RF_M3_RETRY_MAX        3     /* 连续重传上限, 超限回握手 */
+#define RF_M3_485_PERIOD       500   /* 485 空闲超时: 超时发保活命令占用轮次(条件2) ms */
 
 /* 链路监控 (模式3): 掉线发 RF 探测命令重连 + SYS LED 报警 */
 #define RF_LINK_CORRECT_MS 3000   /* 3s 无有效帧: 发一次 RF_CMD_LINK_TEST 探测 */
@@ -87,6 +80,7 @@ static uint16_t RF_M3_LAST_TX_MS;   /* 主机最近发帧时刻 (TICK_MS) */
 static uint16_t RF_M3_LAST_RX_MS;   /* 主机最近收到帧时刻 (TICK_MS) */
 static uint8_t  RF_M3_RETRY_CNT;    /* 主机连续重传计数 */
 static volatile uint8_t RF_M3_RX_EVT = 0; /* 收到有效帧事件 (统一异步主从, 主循环处理) */
+static volatile uint8_t RF_PULL_485_REQ = 0; /* 从机: 收到主站拉取485请求(有485则回485帧) */
 static uint8_t UART3_SLAVE_RET_CI = (CI_DH | CI_DL);  /* 从站回传内容指示 (主站要求 CI₂, 默认 DI) */
 static uint8_t RF_M3_LAST_CI1 = (CI_DH | CI_DL);      /* 主机最近发送 CI₁ (重传用) */
 static uint8_t RF_M3_LAST_CI2 = (CI_DH | CI_DL);      /* 主机最近发送 CI₂ (重传用) */
@@ -245,11 +239,51 @@ static void rf_send_slave(uint8_t ci)
     }
 }
 
+/* ==================== 发送 485 帧 (主机→从机; 从机收到后经其 UART1 发出) ==================== */
+static void rf_send_485(void)
+{
+    uint8_t d[UART1_BUF_SIZE + 3];
+    uint8_t dlen = uart1_take_frame(d + 3);
+    if (dlen == 0) return;
+    d[0] = UART3_PEER_ADDR;
+    d[1] = 0x37;                        /* 定位头|内容指示=1 */
+    d[2] = (uint8_t)(0x80 | (dlen & 0x7F));
+    RF_APP_TX_CNT++;
+    DBG_STR("[D]485tx len="); DBG_DEC(dlen); DBG_NL();
+    if (rf_tx_start(d, (uint8_t)(dlen + 3))) {
+        RF_APP_OVERFLOW++;
+        rf_led_refresh();
+    }
+    UART1_LAST_TX_MS = TICK_MS;
+}
+
+/* ==================== 发送 485 拉取帧 (长度0, 无数据) ====================
+ * 主机条件2(485定时到)本机无485数据时发送, 作为"拉取从机485"信号;
+ * 从机收到长度0帧回传本机485(无则回长度0), 实现从机→主机上行。
+ */
+static void rf_send_485_poll(void)
+{
+    uint8_t d[3];
+    d[0] = UART3_PEER_ADDR;
+    d[1] = 0x37;                        /* 定位头|内容指示=1 */
+    d[2] = 0x80;                        /* bit7=1: 485 帧, 长度=0 */
+    RF_APP_TX_CNT++;
+    if (rf_tx_start(d, 3)) {
+        RF_APP_OVERFLOW++;
+        rf_led_refresh();
+    }
+    UART1_LAST_TX_MS = TICK_MS;
+}
+
 /* ==================== 发送测试帧 (控制指令 0x20) ==================== */
 void rf_app_test_tx(void)
 {
     rf_send_master(UART3_TX_CONTENT[0], UART3_TX_CI2[0]);   /* 任务0: CI₁ + CI₂ */
 }
+
+/* ==================== 内部状态只读 (快照/诊断 0x2B~0x2C) ==================== */
+uint8_t rf_app_get_link(void)  { return RF_M3_LINK; }
+uint8_t rf_app_get_state(void) { return RF_M3_STATE; }
 
 /* ==================== 发送 RF 命令帧 (content=1) ====================
  * 净负荷 = [地址] + 帧; 命令帧 = [地址][0b00110111][0 CCCCCCC], 3 字节
@@ -285,19 +319,17 @@ void rf_app_rx_isr(const uint8_t *buf, uint8_t len)
     if (buf[0] != UART3_SELF_ADDR && buf[0] != FRAME_ADDR_BCAST) return;
     if ((buf[1] >> 1) != FRAME_HEAD) return;          /* 定位头 */
 
-    RF_M3_RX_EVT = 1;   /* 有效帧事件 (统一异步主从, 主循环处理) */
-
     if (buf[1] & 0x01) {                              /* 内容指示=1: 命令/485 帧 */
         if (buf[2] & 0x80) {                          /* bit7=1: RS-485 数据帧 */
             uint8_t l = buf[2] & 0x7F;
             if (l > 0 && (uint8_t)(3 + l) <= len)
                 uart1_send(&buf[3], l);               /* 485 数据 -> UART1 发出 */
+            else if (l == 0 && UART3_RF_ROLE == RF_ROLE_SLAVE)
+                RF_PULL_485_REQ = 1;                  /* 长度0=拉取: 从机待回传485 */
         } else {
-            /* 命令帧: 命令码在 buf[2] 低7bit (doc/frame.md) */
-            if ((buf[2] & 0x7F) == RF_CMD_LINK_TEST
-                && UART3_RF_ROLE == RF_ROLE_SLAVE) {
-                RF_ACK_PENDING = 1;                   /* 从机收到探测 -> 回 ACK */
-            }
+            /* 命令帧: 从机收到任何命令帧都回 ACK (握手/链路保持) */
+            if (UART3_RF_ROLE == RF_ROLE_SLAVE)
+                RF_ACK_PENDING = 1;
         }
         RF_M3_LINK = 1;                               /* 收到命令帧 = 对端在线 */
         RF_LINK_LAST_RX_MS = TICK_MS;                 /* 命令/485 帧也算链路活动 */
@@ -305,6 +337,8 @@ void rf_app_rx_isr(const uint8_t *buf, uint8_t len)
         RF_LINK_ALARM = 0;
         return;                                       /* 命令/485 帧不更新输出 */
     }
+
+    RF_M3_RX_EVT = 1;   /* 仅遥测帧触发回包事件 (485/命令帧不误判主机状态机) */
 
     /* 遥测帧: 按角色解析
      * 主机收到从站回传: [0x36][CI][数据]            -> idx=3
@@ -359,20 +393,14 @@ void rf_app_rx_isr(const uint8_t *buf, uint8_t len)
     RF_LINK_PROBED = 0;             /* 允许再次探测 */
     RF_LINK_ALARM = 0;              /* 灭链路报警 (rf_led_refresh 生效) */
     RF_OUT_UPDATED = 1;
-    if (UART3_RF_MODE == RF_MODE_ASYNC_TXRX) {
-        RF_ACK_PENDING = 1;   /* 异步收发: 请求应答 */
-        if (UART3_RF_ROLE == RF_ROLE_MASTER) {
-            RF_M3_STATE     = 1;            /* 主机收到第一帧 -> 进入应答模式 */
-            RF_M3_LAST_RX_MS = TICK_MS;
-        }
-    }
 }
 
-/* ==================== 发送表周期换算 (128us -> ms) ==================== */
+/* ==================== 发送表周期换算 (TIM4 6kHz tick -> ms) ====================
+ * 周期值单位 = TIM4 节拍(166.7us, 6kHz); 6 tick = 1ms, 故 ms = p/6 */
 static uint16_t rf_period_ms(uint16_t pl, uint16_t ph)
 {
     uint32_t p = ((uint32_t)ph << 16) | pl;
-    uint32_t ms = (uint32_t)(((uint64_t)p * 128) / 1000);
+    uint32_t ms = (uint32_t)(p / 6);   /* 6 tick = 1ms (TIM4 6kHz) */
     if (ms < 1) ms = 1;
     if (ms > 60000) ms = 60000;   /* 上限保护 */
     return (uint16_t)ms;
@@ -445,11 +473,10 @@ void rf_app_poll(void)
 }
 
 /* ==================== 主循环 (mode3 远程发射) ====================
- * 公共维护 + 按 UART3_RF_MODE 的 4 模式收发调度
+ * 公共维护 + 统一异步主从收发调度
  */
 void rf_app_run(void)
 {
-    uint8_t mode = UART3_RF_MODE;
     uint16_t now = rtc_get_ms();
     uint8_t i;
 
@@ -524,27 +551,58 @@ void rf_app_run(void)
 
     DBG_POS(10);   /* 位置码: 已通联 */
     if (UART3_RF_ROLE == RF_ROLE_SLAVE) {
-        /* 从机: 被动 - 收到主站帧回传从机数据 (按主站要求的 CI₂) */
-        if (RF_M3_RX_EVT && !RF_TX_BUSY) {
+        /* 从机: 被动 - 收到主站任何帧(遥测/命令)都回传 (按主站要求的 CI₂) */
+        if ((RF_M3_RX_EVT || RF_ACK_PENDING || RF_PULL_485_REQ) && !RF_TX_BUSY) {
             RF_M3_RX_EVT = 0;
-            rf_send_slave(UART3_SLAVE_RET_CI);
+            RF_ACK_PENDING = 0;
+            if (RF_PULL_485_REQ) {
+                RF_PULL_485_REQ = 0;
+                if (uart1_has_frame())
+                    rf_send_485();                 /* 拉取+有485 -> 回485数据帧 */
+                else
+                    rf_send_485_poll();            /* 拉取+无485 -> 回485长度0帧(表示无数据) */
+            } else {
+                rf_send_slave(UART3_SLAVE_RET_CI); /* 响应遥测/命令 -> 回遥测ACK */
+            }
         }
     } else {
         /* 主机: 主动 - 按发射表周期发 (每 enabled 任务发 CI₁+CI₂), 超时重传, 连续失败回握手 */
         if (RF_M3_STATE == 0) {
-            /* 待发: 找第一个到期的 enabled 任务发一帧 */
-            for (i = 0; i < 32; i++) {
-                if ((UART3_TX_ENA[i] & 0x01) && !RF_TX_BUSY &&
-                    (uint16_t)(now - RF_TX_LAST[i]) >=
-                        rf_period_ms(UART3_TX_PERIOD_L[i], UART3_TX_PERIOD_H[i])) {
-                    RF_TX_LAST[i] = now;
-                    RF_M3_STATE = 1;
+            /* 待发: 三条件调度决定本轮发什么 (485优先 / 遥测 / 485空闲 / 保活) */
+            uint8_t have485 = uart1_has_frame();
+            uint8_t task = 0xFF, ci1 = 0, ci2 = 0, sent = 0;
+            /* 找发射表到期任务 (遥测) */
+            if (!RF_TX_BUSY) {
+                for (i = 0; i < 32; i++) {
+                    if ((UART3_TX_ENA[i] & 0x01) &&
+                        (uint16_t)(now - RF_TX_LAST[i]) >=
+                            rf_period_ms(UART3_TX_PERIOD_L[i], UART3_TX_PERIOD_H[i])) {
+                        task = i; ci1 = UART3_TX_CONTENT[i]; ci2 = UART3_TX_CI2[i];
+                        break;
+                    }
+                }
+                /* 条件1: 485 缓冲满 -> 优先发 485 (抢占遥测) */
+                if (have485 && uart1_is_full()) {
+                    rf_send_485(); sent = 1;
+                } else if (task != 0xFF) {
+                    RF_TX_LAST[task] = now;             /* 发遥测 */
+                    RF_M3_LAST_CI1 = ci1; RF_M3_LAST_CI2 = ci2;
+                    rf_send_master(ci1, ci2); sent = 1;
+                } else if (have485) {
+                    rf_send_485(); sent = 1;            /* 条件3: 无遥测到期+有485 -> 发485 */
+                } else if ((uint16_t)(now - UART1_LAST_TX_MS) >= RF_M3_485_PERIOD) {
+                    /* 条件2: 485 定时到 */
+                    if (have485) {
+                        rf_send_485(); sent = 1;              /* 有485: 发485 */
+                    } else {
+                        rf_send_485_poll();                   /* 无485: 发485长度0帧拉取从机(不进state=1) */
+                    }
+                    UART1_LAST_TX_MS = now;
+                }
+                if (sent) {
+                    RF_M3_STATE = 1;                    /* 进等回包 */
                     RF_M3_LAST_TX_MS = TICK_MS;
                     RF_M3_RETRY_CNT = 0;
-                    RF_M3_LAST_CI1 = UART3_TX_CONTENT[i];
-                    RF_M3_LAST_CI2 = UART3_TX_CI2[i];
-                    rf_send_master(RF_M3_LAST_CI1, RF_M3_LAST_CI2);
-                    break;   /* 每次只发一帧 */
                 }
             }
         } else {
@@ -595,6 +653,7 @@ void rf_app_init(void)
     RF_M3_LAST_TX_MS = 0;
     RF_M3_LAST_RX_MS = 0;    RF_M3_RETRY_CNT = 0;
     RF_M3_RX_EVT = 0;    RF_M3_LAST_CI1 = (CI_DH | CI_DL);    RF_M3_LAST_CI2 = (CI_DH | CI_DL);
+    RF_PULL_485_REQ = 0;
     RF_LINK_LAST_RX_MS = TICK_MS;   /* 上电: 链路视为正常 */
     RF_LINK_PROBED = 0;
     RF_LINK_ALARM = 0;

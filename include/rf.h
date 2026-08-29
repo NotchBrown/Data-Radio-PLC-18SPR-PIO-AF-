@@ -14,8 +14,11 @@
 void rf_init(void);
 
 /* 按 UART3_RF_* (0x30~0x38) 重新配置 SX1278 (频率/SF/BW/CR/功率/前导/同步/LNA)
- * rf_init 后调用; uart3_config_restore 恢复 EEPROM 后也需调用 */
+ * rf_init 后调用; uart3_config_restore 恢复 EEPROM 后也需调用; 兼作 RF 唤醒 */
 void rf_apply_config(void);
+
+/* 进入 STDBY, 停止 RF 收发 (省电+静默; 模式1/4 用; 唤醒用 rf_apply_config) */
+void rf_sleep(void);
 
 /* 寄存器读写 (供上层/调试使用) */
 uint8_t rf_read_reg(uint8_t addr);

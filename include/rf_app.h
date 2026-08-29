@@ -35,4 +35,8 @@ extern volatile uint8_t  RF_APP_FE_REQUEST; /* 频偏校正请求 (uart3 0x26 �
 /* 发送测试帧 (控制指令 0x20): 用发送表[0] 内容指示发一帧 */
 void rf_app_test_tx(void);
 
+/* 内部状态只读 (快照/诊断 0x2B~0x2C): 通联标志 / 主状态机 */
+uint8_t rf_app_get_link(void);
+uint8_t rf_app_get_state(void);
+
 #endif /* __RF_APP_H */
