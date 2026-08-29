@@ -23,10 +23,19 @@ void uart1_init(void);
 /* 使能/禁用 UART1 (485 透传: 运行模式3 且 UART1_EN=1 时启用) */
 void uart1_enable(uint8_t on);
 
-/* 主循环: 485 上行透传检查 (缓冲有数据且满/超时 -> 组 485 帧发 RF) */
-void uart1_poll(void);
+/* 是否有 485 待发帧 (缓冲有数据且满足组帧: 满 或 距上次收字节超时) */
+uint8_t uart1_has_frame(void);
+/* 485 缓冲是否满 (三条件条件1: 满则优先发) */
+uint8_t uart1_is_full(void);
+/* 取走 485 待发数据 (返回长度, 0=无); 清缓冲 (组帧+RF发送由 rf_app 调度) */
+uint8_t uart1_take_frame(uint8_t *buf);
+/* 上次发 485 时刻 (TICK_MS; 供 rf_app 判断 485 空闲超时) */
+extern volatile uint16_t UART1_LAST_TX_MS;
 
 /* 485 下行: 收到 RF 485 帧数据, 经 UART1 发出 (CTRL 方向控制, 半双工) */
 void uart1_send(const uint8_t *data, uint8_t len);
+
+/* 当前 485 接收缓冲长度 (快照/诊断用) */
+uint8_t uart1_get_len(void);
 
 #endif /* __UART1_H */

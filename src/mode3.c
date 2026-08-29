@@ -11,13 +11,14 @@
 void mode3_run(void)
 {
     static uint8_t m3_once = 0;
-    /* UART3 保持使能: 供 RF_DEBUG 打印诊断链路 (RX 中断在但 uart3_process
-     * 不在此调用, 配置协议帧不会执行, 不影响运行) */
-    uart3_enable(1);
+#ifdef RF_DEBUG
+    uart3_enable(1);   /* Debug 构建: 保留 UART3 供 RF_DEBUG 打印诊断 */
+#else
+    uart3_enable(0);   /* Release: 运行模式彻底禁用 UART3 */
+#endif
     if (!m3_once) {               /* 进入模式3 标志(只打一次): 确认模式切换+UART3输出 */
         m3_once = 1;
         DBG_STR("[D]M3 enter\r\n");
     }
-    rf_app_run();         /* RF 收发主循环        */
-    uart1_poll();         /* 485 上行透传检查     */
+    rf_app_run();         /* RF 收发主循环 (含 485 三条件调度) */
 }

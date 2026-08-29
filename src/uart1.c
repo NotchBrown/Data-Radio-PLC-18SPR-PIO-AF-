@@ -11,7 +11,7 @@
  *   下行: 收到 RF 485 帧 -> uart1_send 经 UART1 发出 (CTRL 方向控制)
  *
  * 注意: STM8S UART 无硬件 FIFO, RX 中断必须尽快读 DR, 否则下一字节覆盖
- *       (9600 波特率约 1.04ms/字节, TIM4 12kHz ISR 每 83us, 有足够余量)
+ *       (9600 波特率约 1.04ms/字节, TIM4 6kHz ISR 每 167us, 有足够余量)
  */
 #include "uart1.h"
 #include "uart3.h"
@@ -31,6 +31,8 @@ static volatile uint8_t  UART1_RX_LEN = 0;     /* 缓冲中字节数 */
 static volatile uint8_t  UART1_RX_FULL = 0;    /* 缓冲满标志 */
 static volatile uint16_t UART1_RX_LAST_MS = 0; /* 上次收字节时刻 (RTC_MS) */
 static volatile uint8_t  UART1_ENABLED = 0;    /* 485 透传运行中 */
+/* 上次发 485 时刻 (TICK_MS; 供 rf_app 判断 485 空闲超时, 三条件条件2) */
+volatile uint16_t UART1_LAST_TX_MS = 0;
 
 /* ==================== 初始化 ==================== */
 void uart1_init(void)
@@ -92,41 +94,36 @@ void UART1_TX_IRQHandler(void) __interrupt(ITC_IRQ_UART1_TX)
 {
 }
 
-/* ==================== 主循环: 485 上行透传 ====================
- * 触发条件: 缓冲有数据 且 (缓冲满 或 距上次收字节 > 组帧超时)
- * 组 485 帧 (doc/frame.md): [地址][0x37][1 L][数据×L] -> rf_tx_start
- */
-void uart1_poll(void)
+/* ==================== 485 上行: 由 rf_app 主从调度发 (三条件) ====================
+ * 提供: 是否有待发 / 缓冲是否满 / 取走数据; 组帧+RF发送由 rf_app 统一调度 */
+uint8_t uart1_has_frame(void)
 {
-    uint8_t fbuf[UART1_BUF_SIZE + 3];
-    uint8_t i, len, bmax;
     uint16_t idle;
-
-    if (!UART1_ENABLED) return;
-    if (UART1_RX_LEN == 0) return;
-    if (RF_TX_BUSY) return;   /* RF 忙: 保留数据下一轮再发, 不丢 */
-
-    bmax = UART1_BUF_MAX;
-    if (bmax == 0 || bmax > UART1_BUF_SIZE) bmax = 64;
-
+    if (!UART1_ENABLED) return 0;
+    if (UART1_RX_LEN == 0) return 0;
+    if (UART1_RX_FULL) return 1;                       /* 缓冲满 */
     idle = (uint16_t)(rtc_get_ms() - UART1_RX_LAST_MS);
-    if (!UART1_RX_FULL && idle < UART1_TIMEOUT) return;   /* 未满且未超时 */
+    if (idle >= UART1_TIMEOUT) return 1;               /* 组帧超时 */
+    return 0;
+}
 
-    /* 原子取走缓冲 */
+uint8_t uart1_is_full(void)
+{
+    return (UART1_ENABLED && UART1_RX_FULL) ? 1 : 0;   /* 条件1: 缓冲满优先发 */
+}
+
+uint8_t uart1_take_frame(uint8_t *buf)
+{
+    uint8_t i, len;
+    if (!UART1_ENABLED) return 0;
+    if (UART1_RX_LEN == 0) return 0;
     __critical {
         len = UART1_RX_LEN;
         UART1_RX_LEN = 0;
         UART1_RX_FULL = 0;
-        for (i = 0; i < len; i++) fbuf[i] = UART1_RX_BUF[i];
+        for (i = 0; i < len; i++) buf[i] = UART1_RX_BUF[i];
     }
-
-    /* 组 485 帧: 数据后移 3 字节, 前插 [地址][0x37][1 L] */
-    for (i = len; i > 0; i--) fbuf[i + 2] = fbuf[i - 1];
-    fbuf[0] = UART3_PEER_ADDR;
-    fbuf[1] = 0x37;                          /* 定位头|内容指示=1 */
-    fbuf[2] = (uint8_t)(0x80 | (len & 0x7F));
-    DBG_STR("[D]485tx len="); DBG_DEC(len); DBG_NL();
-    rf_tx_start(fbuf, (uint8_t)(len + 3));
+    return len;
 }
 
 /* ==================== 485 下行: 数据经 UART1 发出 ====================
@@ -151,4 +148,10 @@ void uart1_send(const uint8_t *data, uint8_t len)
         if (++guard > 2000) break;
     }
     UART1_CTRL_RX();
+}
+
+/* ==================== 485 接收缓冲长度 (快照/诊断 0x2E) ==================== */
+uint8_t uart1_get_len(void)
+{
+    return UART1_RX_LEN;
 }

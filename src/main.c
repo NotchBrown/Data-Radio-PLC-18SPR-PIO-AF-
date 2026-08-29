@@ -63,7 +63,7 @@ static void led_sw_init(void)
 /* ------------------------------------------------------------------
  * setup(): 初始化顺序
  *   1. 时钟   -- 必须最先: TIM4/UART3 时序都依赖实际主频
- *   2. TIM4   -- 1ms 节拍(12kHz/83us), 按 24MHz 配预分频并开中断, 紧跟时钟
+ *   2. TIM4   -- 1ms 节拍(6kHz/167us), 按 24MHz 配预分频并开中断, 紧跟时钟
  *   3. SPI    -- 软件 NSS + 各片选引脚
  *   4. DIO    -- DI 浮空输入, DO 推挽输出高
  *   5. ADC    -- ADC2 10bit 初始化
@@ -73,7 +73,7 @@ static void led_sw_init(void)
  * ------------------------------------------------------------------ */
 void setup()
 {
-    clock_init();    /* 1. 16MHz HSI        */
+    clock_init();    /* 1. 24MHz HSE        */
     timer_init();    /* 2. TIM4 1ms 节拍中断 */
     spi_init();      /* 3. SPI 主控 + 软件NSS(见 spi.c) */
     rf_init();       /* 4. RA-01 SX1278 LoRa 初始化 (依赖 SPI) */
@@ -86,9 +86,13 @@ void setup()
     dbg_init();      /* 10.5 调试打印就绪 (仅 RF_DEBUG 构建的调用点打印) */
     DBG_STR("[D]DBG boot pos="); DBG_DEC(dbg_pos_get()); DBG_NL();   /* 打印卡死位置码 */
     DBG_POS(0);   /* 清卡死位置码 */
+    DBG_STR("[D]pre-restore\r\n");
     uart3_config_restore(); /* 11. 上电恢复 EEPROM 配置 (射频/任务/地址/485) */
+    DBG_STR("[D]post-restore\r\n");
     rf_apply_config();      /* 11.5 按恢复后的 RF 参数重新配置 SX1278 (频率/SF/BW/CR等) */
+    DBG_STR("[D]post-apply\r\n");
     uart1_init();    /* 12. UART1 RS-485 (用恢复后的波特率) */
+    DBG_STR("[D]post-uart1\r\n");
     uart3_send_id(); /* 13. 上电上报 MCU ID 帧 */
 }
 
@@ -116,6 +120,17 @@ void loop()
 
     /* 3. 检测拨码 -> 模式号 */
     mode = (uint8_t)(1 + (run ? 2 : 0) + (dbg ? 1 : 0));
+
+    /* RF 开关: 模式1/4 静默(STDBY), 模式2/3 唤醒(RXCONT); 仅实际切换时操作 */
+    {
+        static uint8_t rf_need_on = 1;   /* 上电 rf_init 已使能 */
+        uint8_t want = (mode == 2 || mode == 3) ? 1 : 0;
+        if (want != rf_need_on) {
+            if (want) rf_apply_config();  /* 唤醒 */
+            else      rf_sleep();         /* 静默 */
+            rf_need_on = want;
+        }
+    }
 
     /* 4. switch 跳转到对应模式的周期性子程序 */
     switch (mode) {
