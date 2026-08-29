@@ -31,7 +31,7 @@
 9. 三个指示灯（RUN_LED、DEBUG_LED、SYSTEM_LED）均是推挽点亮
 10. 两个拨码开关（RUN_CTRL和DEBUG_CTRL）使能时候应是低电平
 11. NRST和TLI均是上拉的，当对应按钮按下则变为低电平
-12. 主时钟采用16MHz内部RC（HSI，外部晶振暂未启用）
+12. 主时钟采用外部无源晶振 HSE 24MHz（需 OPT7 WAITSTATE=1，见 doc/clock.md；HSI 16MHz 仅复位默认，setup 后切换）
 13. 拨码模式（拨码使能=低电平；LED 跟随拨码，使能=亮）：
     DEBUG=PH3, RUN=PH2, 模式号=1+RUN*2+DEBUG
     | 模式 | DEBUG | RUN | 说明 | UART3 | DEBUG_LED | RUN_LED |

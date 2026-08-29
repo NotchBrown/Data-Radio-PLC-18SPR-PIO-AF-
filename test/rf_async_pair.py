@@ -169,8 +169,8 @@ def configure_board(ser, name, self_addr, peer_addr, role, content, period_l, pe
 
 
 def period_to_lh(period_ms: int):
-    """周期 ms -> (低16bit, 高16bit), 单位 128us"""
-    p = max(1, int(period_ms * 1000 / 128))
+    """周期 ms -> (低16bit, 高16bit), 单位 = TIM4 6kHz 节拍(166.7us): 1ms = 6 tick"""
+    p = max(1, int(period_ms * 6))
     return p & 0xFFFF, (p >> 16) & 0xFFFF
 
 
