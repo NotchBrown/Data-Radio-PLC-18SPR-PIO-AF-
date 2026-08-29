@@ -58,5 +58,10 @@ void rtc_set_day(uint8_t v);
 void rtc_set_mon(uint8_t v);
 void rtc_set_year(uint8_t v);
 
+/* ---- 诊断 (临时, 测 TIM4 实际频率) ---- */
+extern volatile uint32_t TIM4_TICK_CNT;
+void timer_dbg_dump(void);
+void timer_dbg_periodic(void);
+
 #endif /* __TIMER_H */
 

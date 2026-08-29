@@ -19,7 +19,9 @@
  */
 #include "timer.h"
 #include "rf.h"
+#include "dbg.h"
 #include <stm8s.h>
+#include <stm8s_clk.h>
 
 /* 私有: 最小节拍子计数, 每 TICKS_PER_MS 次=1ms (16M/4k=4, 24M/6k=6) */
 #define TICKS_PER_MS  6
@@ -37,6 +39,9 @@ volatile uint8_t  RTC_YEAR = 0;
 /* 1ms 递增毫秒计数 (uint16 回绕, 差值正确) */
 volatile uint16_t TICK_MS = 0;
 
+/* TIM4 中断总计数 (诊断: 测实际 TIM4 频率) */
+volatile uint32_t TIM4_TICK_CNT = 0;
+
 /* 当月天数(含闰年2月) */
 static uint8_t days_in_month(uint8_t mon, uint8_t year)
 {
@@ -53,6 +58,7 @@ static uint8_t days_in_month(uint8_t mon, uint8_t year)
  * 使用与 stm8s_it.h 声明一致的处理器名(向量23被其占用, 不能用别的名字) */
 void TIM4_UPD_OVF_IRQHandler(void) __interrupt(ITC_IRQ_TIM4_OVF)
 {
+    TIM4_TICK_CNT++;                      /* 诊断: 实际 TIM4 中断计数 */
     /* 6kHz 最小节拍: 每 TICKS_PER_MS 次=1ms */
     if (++rtc_sub_ms >= TICKS_PER_MS) {   /* 6次 = 1ms(精确) */
         rtc_sub_ms = 0;
@@ -96,15 +102,47 @@ void timer_init(void)
     RTC_MON  = 1;
     RTC_YEAR = 0;
 
-    /* 预分频8 -> 3MHz; ARR=499 -> 周期500 -> 6000Hz 精确(167us) @24MHz */
-    TIM4->PSCR = (uint8_t)TIM4_PRESCALER_8;
-    TIM4->ARR  = 499;
+    /* 预分频16 -> 1.5MHz; ARR=249 -> 周期250 -> 6000Hz 精确(167us) @24MHz
+     * 注: TIM4 ARR 为 8 位(0~255), 原 ARR=499 溢出截断为243 致实际12.3kHz(RTC快2倍), 已修正 */
+    TIM4->PSCR = (uint8_t)TIM4_PRESCALER_16;
+    TIM4->ARR  = 249;
     /* 清更新标志 */
     TIM4->SR1  = (uint8_t)(~TIM4_IT_UPDATE);
     /* 使能更新中断 */
     TIM4->IER |= TIM4_IT_UPDATE;
     /* 使能计数 */
     TIM4->CR1 |= TIM4_CR1_CEN;
+}
+
+/* ==================== 诊断 (临时, 定位 RTC 走时快 2 倍) ==================== */
+void timer_dbg_dump(void)
+{
+    DBG_STR("[D]clkMHz="); DBG_DEC((uint16_t)(CLK_GetClockFreq() / 1000000UL));
+    DBG_STR(" pscr="); DBG_HEX8(TIM4->PSCR);
+    DBG_STR(" arr="); DBG_HEX8(TIM4->ARR);
+    DBG_NL();
+}
+
+/* 每 1000 TICK_MS 打印 TIM4 中断计数差; 理想应 6000 (6kHz), 若约 12000 则 TIM4 实际 12kHz */
+void timer_dbg_periodic(void)
+{
+    static uint16_t last_tick = 0;
+    static uint16_t last_cnt  = 0;
+    static uint8_t  first = 1;
+    if (first) {
+        last_tick = TICK_MS;
+        last_cnt  = (uint16_t)TIM4_TICK_CNT;
+        first = 0;
+        return;
+    }
+    if ((uint16_t)(TICK_MS - last_tick) >= 1000) {
+        uint16_t dc = (uint16_t)TIM4_TICK_CNT - last_cnt;
+        uint16_t dt = (uint16_t)(TICK_MS - last_tick);
+        last_tick = TICK_MS;
+        last_cnt  = (uint16_t)TIM4_TICK_CNT;
+        DBG_STR("[D]tick_cnt_diff="); DBG_DEC(dc);
+        DBG_STR(" per_tick="); DBG_DEC(dt); DBG_NL();
+    }
 }
 
 /* ==================================================================

@@ -84,6 +84,9 @@ void setup()
     led_sw_init();   /* 9. LED + 拨码        */
     uart3_init();    /* 10. UART3 工作模式   */
     dbg_init();      /* 10.5 调试打印就绪 (仅 RF_DEBUG 构建的调用点打印) */
+#ifdef RF_DEBUG
+    timer_dbg_dump();   /* 诊断: 打印实际主频 + TIM4 寄存器 */
+#endif
     DBG_STR("[D]DBG boot pos="); DBG_DEC(dbg_pos_get()); DBG_NL();   /* 打印卡死位置码 */
     DBG_POS(0);   /* 清卡死位置码 */
     DBG_STR("[D]pre-restore\r\n");
@@ -108,6 +111,9 @@ void loop()
 {
     uint8_t dbg, run, mode;
 
+#ifdef RF_DEBUG
+    timer_dbg_periodic();   /* 诊断: 每 1000 TICK_MS 打印 TIM4 中断计数 */
+#endif
     uart3_dbg_poll();   /* 诊断: 任意模式打印 UART3 收到的原始字节 */
 
     /* 1. 先读拨码 (同周期内保持一致) */
