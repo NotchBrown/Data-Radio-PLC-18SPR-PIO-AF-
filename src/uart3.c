@@ -14,6 +14,7 @@
 #include "dac.h"
 #include "rf.h"
 #include "rf_app.h"
+#include "uart1.h"
 #include "config.h"
 #include "dbg.h"
 #include <Arduino.h>
@@ -25,6 +26,9 @@
 #define UART3_HEAD_WRITE 0x37     /* 写入帧定位头 */
 #define UART3_HEAD_READ  0x36     /* 读取帧定位头 */
 #define UART3_MCU_ID_BASE 0x48CD  /* STM8S208 唯一ID基址 (RM0016), 12字节 */
+
+/* 状态快照 (0x2A): 连发的标准读帧数 */
+#define UART3_SNAP_N  28
 
 /* 接收状态机 */
 #define ST_IDLE  0
@@ -55,6 +59,7 @@ static volatile uint8_t  UART3_READ;     /* 1=读取帧, 0=写入帧 */
 static volatile uint8_t  UART3_RX_OK;    /* 完整帧标志 */
 static volatile uint8_t  UART3_WRITE_EN; /* 0=只读(拦截写), 1=允许读写 */
 static volatile uint16_t UART3_LAST_MS;  /* 最近收字节时刻 (超时用) */
+static volatile uint8_t  UART3_SNAP_PENDING; /* 状态快照待发 (0x2A 触发) */
 
 /* RX 回显诊断缓冲 (仅 RF_DEBUG): ISR 存收到的原始字节, 主循环打印,
  * 用于确认 UART3 是否真的收到上位机配置帧 (排查配置无响应) */
@@ -87,7 +92,6 @@ uint8_t  UART3_TX_CI2[32];        /* CI₂: 要求从站回传内容指示 (0x40
 uint8_t  UART3_TX_ENA[32];
 uint16_t UART3_TX_PERIOD_L[32];
 uint16_t UART3_TX_PERIOD_H[32];
-static uint16_t UART3_TX_LAST[32];   /* 各任务上次发射时刻(ms) (uart3_tx_run 用) */
 
 /* RF 高层参数 (doc/upperpc.md 0x30~0x38; 存 EEPROM, 上电按此配 SX1278) */
 uint32_t UART3_RF_FREQ     = CFG_DFLT_FREQ;
@@ -194,6 +198,11 @@ static uint16_t uart3_read_addr(uint8_t addr)
     case 0x26: return UART3_FE_STATUS;                   /* 校正状态 */
     case 0x27: return (uint16_t)UART3_FE_VALUE;          /* 校正值 (Hz, 有符号) */
     case 0x28: return UART3_FE_EN;                       /* 校正开关 */
+    case 0x29: return 0x0000;                            /* 应用 RF 配置 (写触发) */
+    case 0x2B: return rf_app_get_link();                 /* 链路状态 (只读) */
+    case 0x2C: return rf_app_get_state();                /* RF 状态机 (只读) */
+    case 0x2D: return dbg_pos_get();                     /* 卡死位置码 (只读) */
+    case 0x2E: return uart1_get_len();                   /* 485 缓冲长度 (只读) */
     }
     if (addr >= 0x40 && addr <= 0x5F)   /* CI₂[32]: 要求从站回传内容指示 */
         return UART3_TX_CI2[addr - 0x40];
@@ -276,6 +285,12 @@ static uint16_t uart3_write_addr(uint8_t addr, uint16_t val)
         return UART3_FE_STATUS;
     case 0x27: UART3_FE_VALUE = (int16_t)val; return (uint16_t)UART3_FE_VALUE;
     case 0x28: UART3_FE_EN = (val) ? 1 : 0; return UART3_FE_EN;
+    case 0x29:                                          /* 应用 RF 配置: C 类参数立即生效 */
+        if (val == 0x0001) rf_apply_config();
+        return 0x0000;
+    case 0x2A:                                          /* 状态快照: 写0x0001 触发 */
+        UART3_SNAP_PENDING = (val == 0x0001);
+        return UART3_SNAP_N;                            /* 回复帧数据 = 快照帧数 */
     }
     if (addr >= 0x40 && addr <= 0x5F) {   /* CI₂[32]: 要求从站回传内容指示 */
         UART3_TX_CI2[addr - 0x40] = (uint8_t)val;
@@ -374,6 +389,25 @@ static void uart3_reply(uint8_t head, uint8_t addr, uint16_t val)
     uart3_putc(tail);
 }
 
+/* ==================== 状态快照 (0x2A 命令) ====================
+ * 写 0x2A 0x0001 -> 回标准写回复帧(数据=快照帧数 UART3_SNAP_N), 随后连发
+ * UART3_SNAP_N 个标准读帧覆盖全部"动态状态"地址, 供长期稳定性/死机定位。
+ * 全为标准帧, 不破坏 UART3 帧协议。 (宏与标志定义见文件头部) */
+static void uart3_send_snapshot(void)
+{
+    static const uint8_t addrs[UART3_SNAP_N] = {
+        0x03,0x04,0x05,0x06,0x07,0x08,0x09,   /* RTC */
+        0x0A,0x0B,0x0C,0x0D,                   /* DI/DO */
+        0x0E,0x0F,0x10,0x11,                   /* AI */
+        0x12,0x13,0x14,0x15,                   /* AO */
+        0x21,0x22,0x23,0x24,0x25,              /* RF 统计 */
+        0x2B,0x2C,0x2D,0x2E                    /* 内部状态 */
+    };
+    uint8_t i;
+    for (i = 0; i < UART3_SNAP_N; i++)
+        uart3_reply(UART3_HEAD_READ, addrs[i], uart3_read_addr(addrs[i]));
+}
+
 /* ==================== 初始化 ==================== */
 void uart3_init(void)
 {
@@ -423,30 +457,6 @@ void uart3_send_id(void)
         uart3_reply(UART3_HEAD_READ, i, uart3_read_addr(i));
 }
 
-/* ==================== 发射流程调度 ====================
- * 遍历 32 任务: ENA.bit0=1 且到周期 -> rf_send 发送"帧内容指示字段"
- * 周期 = (H<<16|L) * 128us; 调度用 RTC 毫秒(1ms 精度)
- * 注: 当前发送内容为内容指示字段 1 字节, 待帧打包模块扩展完整帧
- */
-void uart3_tx_run(void)
-{
-    uint8_t i;
-    uint16_t now = rtc_get_ms();
-
-    for (i = 0; i < 32; i++) {
-        if (UART3_TX_ENA[i] & 0x01) {
-            uint32_t period = ((uint32_t)UART3_TX_PERIOD_H[i] << 16)
-                            | UART3_TX_PERIOD_L[i];
-            uint32_t ms = (uint32_t)(((uint64_t)period * 128) / 1000);
-            if (ms < 1) ms = 1;
-            if ((uint16_t)(now - UART3_TX_LAST[i]) >= ms) {
-                UART3_TX_LAST[i] = now;
-                rf_send(&UART3_TX_CONTENT[i], 1);
-            }
-        }
-    }
-}
-
 /* ==================== 上电恢复配置 ====================
  * 读 EEPROM 校验通过则回填: 射频白名单(SX1278) + 任务表 + 地址/模式
  * 需在 rf_init() 之后调用 (setup 末尾)
@@ -456,7 +466,9 @@ void uart3_config_restore(void)
     config_table_t cfg;
     uint8_t i;
 
-    if (!config_load(&cfg)) return;   /* 无效/未保存: 用固件默认值 */
+    DBG_STR("[D]c_load\r\n");
+    if (!config_load(&cfg)) { DBG_STR("[D]c_invalid\r\n"); return; }   /* 无效/未保存: 用固件默认值 */
+    DBG_STR("[D]c_ok\r\n");
 
     /* 射频白名单回填 SX1278 */
     for (i = 0; i < RF_CFG_N; i++)
@@ -545,6 +557,12 @@ void uart3_process(void)
         val = uart3_write_addr(addr, val);
 
     uart3_reply(head, addr, val);
+
+    /* 状态快照: 0x2A 触发后连发快照帧 (在回复帧之后) */
+    if (UART3_SNAP_PENDING) {
+        UART3_SNAP_PENDING = 0;
+        uart3_send_snapshot();
+    }
 }
 
 /* ==================== UART3 接收中断 (向量21) ====================
