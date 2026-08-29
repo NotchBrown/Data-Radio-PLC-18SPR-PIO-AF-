@@ -49,7 +49,7 @@ static uint8_t days_in_month(uint8_t mon, uint8_t year)
     return dm[mon - 1];
 }
 
-/* TIM4 更新中断(向量23): 每 ~83us 一次
+/* TIM4 更新中断(向量23): 每 ~167us 一次
  * 使用与 stm8s_it.h 声明一致的处理器名(向量23被其占用, 不能用别的名字) */
 void TIM4_UPD_OVF_IRQHandler(void) __interrupt(ITC_IRQ_TIM4_OVF)
 {
