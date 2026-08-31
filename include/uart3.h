@@ -42,6 +42,7 @@ extern uint8_t UART3_SELF_ADDR;   /* 本机 RF 地址 */
 extern uint8_t UART3_PEER_ADDR;   /* 对端 RF 地址 */
 extern uint8_t UART3_RF_MODE;     /* 收发模式: 固定 0 (统一异步主从, 0x18) */
 extern uint8_t UART3_RF_ROLE;     /* 模式3 主从: 0=从机 1=主机 */
+extern uint8_t UART3_RF_RADIO;    /* 射频调制: 0=LoRa 1=FSK (0x2F) */
 
 /* 发射流程任务表 (UART3 0x80~0xFF + 0x40~0x5F 读写; rf_app 做发送调度) */
 extern uint8_t  UART3_TX_CONTENT[32];  /* 每任务 CI₁ (主站→从站内容指示) */
@@ -53,7 +54,7 @@ extern uint16_t UART3_TX_PERIOD_H[32]; /* 每任务周期高16bit */
 /* RF 高层参数 (0x30~0x38, 存 EEPROM; 上电按此配 SX1278, 空速自动算) */
 extern uint32_t UART3_RF_FREQ;     /* 载波频率 Hz (0x30/0x31) */
 extern uint8_t  UART3_RF_SF;       /* 扩频因子 6~12 (0x32) */
-extern uint8_t  UART3_RF_BW;       /* 带宽 125/250/500 (0x33) */
+extern uint16_t UART3_RF_BW;     /* 带宽 125/250/500 kHz (0x33, 16bit) */
 extern uint8_t  UART3_RF_CR;       /* 编码率 5~8 (0x34) */
 extern uint8_t  UART3_RF_POWER;    /* 发射功率 dBm (0x35) */
 extern uint8_t  UART3_RF_PREAMBLE; /* 前导码 (0x36) */

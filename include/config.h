@@ -12,7 +12,7 @@
 
 /* 配置区魔法数 / 版本 (EEPROM 校验用; 布局变更需升版本使旧数据失效) */
 #define CFG_MAGIC   0x5A
-#define CFG_VERSION 0x06
+#define CFG_VERSION 0x07
 
 /* 射频可持久化寄存器白名单数量 */
 #define RF_CFG_N    13

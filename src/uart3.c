@@ -30,6 +30,12 @@
 /* 状态快照 (0x2A): 连发的标准读帧数 */
 #define UART3_SNAP_N  28
 
+/* FSK 关键寄存器直写映射: UART3 0x39~0x3E -> SX1278 FSK 0x30/31/32/33/34/28
+ * (参考 sx1276Regs-Fsk.h: PACKETCONFIG1=0x30 PACKETCONFIG2=0x31 PAYLOADLENGTH=0x32
+ *  NODEADRS=0x33 BROADCASTADRS=0x34 SYNCVALUE1=0x28) */
+static const uint8_t fsk_reg_map[6] = {0x30, 0x31, 0x32, 0x33, 0x34, 0x28};
+#define UART3_FSK_MAP_BASE 0x39
+
 /* 接收状态机 */
 #define ST_IDLE  0
 #define ST_ADDR  1
@@ -74,6 +80,7 @@ uint8_t UART3_SELF_ADDR = 0x01;   /* 本机 RF 地址 */
 uint8_t UART3_PEER_ADDR = 0x02;   /* 对端 RF 地址 */
 uint8_t UART3_RF_MODE   = 0;      /* 收发模式: 固定 0 (统一异步主从, 0x18) */
 uint8_t UART3_RF_ROLE   = 0;      /* 主从: 0=从机 1=主机 (0x19) */
+uint8_t UART3_RF_RADIO  = 0;      /* 射频调制: 0=LoRa 1=FSK (0x2F) */
 
 /* 频偏校正 (doc/upperpc.md 0x26~0x28): 单位 Hz, 开关默认 0=关 */
 int16_t UART3_FE_VALUE  = 0;      /* 校正值 (Hz, 0x27, 存 EEPROM) */
@@ -96,7 +103,7 @@ uint16_t UART3_TX_PERIOD_H[32];
 /* RF 高层参数 (doc/upperpc.md 0x30~0x38; 存 EEPROM, 上电按此配 SX1278) */
 uint32_t UART3_RF_FREQ     = CFG_DFLT_FREQ;
 uint8_t  UART3_RF_SF       = CFG_DFLT_SF;
-uint8_t  UART3_RF_BW       = CFG_DFLT_BW;
+uint16_t UART3_RF_BW     = CFG_DFLT_BW;
 uint8_t  UART3_RF_CR       = CFG_DFLT_CR;
 uint8_t  UART3_RF_POWER    = CFG_DFLT_POWER;
 uint8_t  UART3_RF_PREAMBLE = CFG_DFLT_PREAMBLE;
@@ -203,7 +210,10 @@ static uint16_t uart3_read_addr(uint8_t addr)
     case 0x2C: return rf_app_get_state();                /* RF 状态机 (只读) */
     case 0x2D: return dbg_pos_get();                     /* 卡死位置码 (只读) */
     case 0x2E: return uart1_get_len();                   /* 485 缓冲长度 (只读) */
+    case 0x2F: return UART3_RF_RADIO;                    /* 射频调制 (0=LoRa 1=FSK) */
     }
+    if (addr >= UART3_FSK_MAP_BASE && addr <= UART3_FSK_MAP_BASE + 5)
+        return rf_read_reg(fsk_reg_map[addr - UART3_FSK_MAP_BASE]);   /* FSK 寄存器直写 */
     if (addr >= 0x40 && addr <= 0x5F)   /* CI₂[32]: 要求从站回传内容指示 */
         return UART3_TX_CI2[addr - 0x40];
     if (addr >= 0x60 && addr <= 0x7F)   /* 射频设置(调试): SX1278 寄存器直写 */
@@ -250,7 +260,7 @@ static uint16_t uart3_write_addr(uint8_t addr, uint16_t val)
     case 0x31: UART3_RF_FREQ = (UART3_RF_FREQ & 0x0000FFFFUL) | ((uint32_t)val << 16);
                return (uint16_t)((UART3_RF_FREQ >> 16) & 0xFFFF);
     case 0x32: UART3_RF_SF = (uint8_t)val; return UART3_RF_SF;
-    case 0x33: UART3_RF_BW = (uint8_t)val; return UART3_RF_BW;
+    case 0x33: UART3_RF_BW = val; return UART3_RF_BW;
     case 0x34: UART3_RF_CR = (uint8_t)val; return UART3_RF_CR;
     case 0x35: UART3_RF_POWER = (uint8_t)val; return UART3_RF_POWER;
     case 0x36: UART3_RF_PREAMBLE = (uint8_t)val; return UART3_RF_PREAMBLE;
@@ -269,8 +279,16 @@ static uint16_t uart3_write_addr(uint8_t addr, uint16_t val)
         if (val == 0x0001) { config_clear(); return 0x0001; }
         return 0x0000;
     /* 控制指令 (0x20~0x28, 见 doc/upperpc.md) */
-    case 0x20:                                          /* RF 发送测试 */
-        if (val == 0x0001) rf_app_test_tx();
+    case 0x20:                                          /* RF 发送测试: 返回测试帧耗时 ms */
+        if (val == 0x0001) {
+            uint16_t t0 = rtc_get_ms();
+            uint8_t guard = 0;
+            rf_app_test_tx();               /* 触发非阻塞发送 (TxDone 由 TIM4 轮询清) */
+            while (RF_TX_BUSY && guard++ < 1000) { /* 等发送完成, 防卡死 */
+                /* 空转等 TIM4 ISR 清 RF_TX_BUSY */
+            }
+            return (uint16_t)(rtc_get_ms() - t0);   /* 测试帧耗时 ms */
+        }
         return 0x0000;
     case 0x21: if (val == 0) RF_APP_RX_CNT = 0;  return RF_APP_RX_CNT;  /* 清零 */
     case 0x22: if (val == 0) RF_APP_CRC_CNT = 0; return RF_APP_CRC_CNT;
@@ -291,6 +309,13 @@ static uint16_t uart3_write_addr(uint8_t addr, uint16_t val)
     case 0x2A:                                          /* 状态快照: 写0x0001 触发 */
         UART3_SNAP_PENDING = (val == 0x0001);
         return UART3_SNAP_N;                            /* 回复帧数据 = 快照帧数 */
+    case 0x2F: UART3_RF_RADIO = (val) ? 1 : 0;
+               rf_apply_config();                 /* 切调制: 立即重配 SX1278 (LoRa/FSK) */
+               return UART3_RF_RADIO; /* 射频调制 */
+    }
+    if (addr >= UART3_FSK_MAP_BASE && addr <= UART3_FSK_MAP_BASE + 5) {
+        rf_write_reg(fsk_reg_map[addr - UART3_FSK_MAP_BASE], (uint8_t)val); /* FSK 寄存器直写 */
+        return rf_read_reg(fsk_reg_map[addr - UART3_FSK_MAP_BASE]);
     }
     if (addr >= 0x40 && addr <= 0x5F) {   /* CI₂[32]: 要求从站回传内容指示 */
         UART3_TX_CI2[addr - 0x40] = (uint8_t)val;
