@@ -120,12 +120,20 @@ void loop()
     dbg = SW_DEBUG_ON();
     run = SW_RUN_ON();
 
-    /* 2. 改变 LED: 拨码使能=灯亮 */
+    /* 2. 改变 LED: 拨码使能=灯亮; 模式3(RUN=1,DEBUG=0) RUN 灯交给 rf_app_run 闪烁 */
     if (dbg) LED_DEBUG_ON(); else LED_DEBUG_OFF();
-    if (run) LED_RUN_ON();   else LED_RUN_OFF();
+    if (run && !dbg) { /* 模式3: RUN 由 rf_app_run 闪烁 */ }
+    else if (run) LED_RUN_ON(); else LED_RUN_OFF();
 
     /* 3. 检测拨码 -> 模式号 */
     mode = (uint8_t)(1 + (run ? 2 : 0) + (dbg ? 1 : 0));
+
+    /* 进入模式3: 复位 RUN 灯闪烁状态 (每次重新进入从"先常亮"开始) */
+    {
+        static uint8_t prev_mode = 0xFF;
+        if (mode == 3 && prev_mode != 3) rf_app_run_reset();
+        prev_mode = mode;
+    }
 
     /* RF 开关: 模式1/4 静默(STDBY), 模式2/3 唤醒(RXCONT); 仅实际切换时操作 */
     {

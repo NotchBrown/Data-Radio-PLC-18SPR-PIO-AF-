@@ -36,23 +36,23 @@
 #define CFG_OFF_FREQ_LO 244        /* 载波频率 低16 (Hz) */
 #define CFG_OFF_FREQ_HI 246        /* 载波频率 高16 (Hz) */
 #define CFG_OFF_SF      248        /* 扩频因子 */
-#define CFG_OFF_BW      249        /* 带宽 */
-#define CFG_OFF_CR      250        /* 编码率 */
-#define CFG_OFF_POWER   251        /* 发射功率 */
-#define CFG_OFF_PREAMBLE 252       /* 前导码 */
-#define CFG_OFF_SYNCWORD 253       /* 同步字 */
-#define CFG_OFF_LNA     254        /* LNA 增益 */
-#define CFG_OFF_FE_LO   255        /* 频偏校正值 低字节 */
-#define CFG_OFF_FE_HI   256        /* 频偏校正值 高字节 */
-#define CFG_OFF_FE_EN   257        /* 频偏校正开关 */
-#define CFG_OFF_U1_BDL  258        /* UART1 485 波特率 低字节 */
-#define CFG_OFF_U1_BDH  259        /* UART1 485 波特率 高字节 */
-#define CFG_OFF_U1_BMAX 260        /* UART1 485 缓冲上限 */
-#define CFG_OFF_U1_TOL  261        /* UART1 485 组帧超时 低字节 */
-#define CFG_OFF_U1_TOH  262        /* UART1 485 组帧超时 高字节 */
-#define CFG_OFF_U1_EN   263        /* UART1 485 透传使能 */
-#define CFG_OFF_CRC     264        /* CRC-8, 覆盖 [0..263] */
-#define CFG_LEN         265        /* 配置区总长 */
+#define CFG_OFF_BW      249        /* 带宽 (2 字节 16bit 小端, 支持 500kHz) */
+#define CFG_OFF_CR      251        /* 编码率 */
+#define CFG_OFF_POWER   252        /* 发射功率 */
+#define CFG_OFF_PREAMBLE 253       /* 前导码 */
+#define CFG_OFF_SYNCWORD 254       /* 同步字 */
+#define CFG_OFF_LNA     255        /* LNA 增益 */
+#define CFG_OFF_FE_LO   256        /* 频偏校正值 低字节 */
+#define CFG_OFF_FE_HI   257        /* 频偏校正值 高字节 */
+#define CFG_OFF_FE_EN   258        /* 频偏校正开关 */
+#define CFG_OFF_U1_BDL  259        /* UART1 485 波特率 低字节 */
+#define CFG_OFF_U1_BDH  260        /* UART1 485 波特率 高字节 */
+#define CFG_OFF_U1_BMAX 261        /* UART1 485 缓冲上限 */
+#define CFG_OFF_U1_TOL  262        /* UART1 485 组帧超时 低字节 */
+#define CFG_OFF_U1_TOH  263        /* UART1 485 组帧超时 高字节 */
+#define CFG_OFF_U1_EN   264        /* UART1 485 透传使能 */
+#define CFG_OFF_CRC     265        /* CRC-8, 覆盖 [0..264] */
+#define CFG_LEN         266        /* 配置区总长 */
 
 /* ==================== 射频白名单 ====================
  * 仅这些寄存器会被保存/恢复: LoRa 配置类, 排除只读/状态/FIFO/指针寄存器
@@ -87,67 +87,66 @@ static uint8_t config_compute_crc(const uint8_t *buf, uint16_t len)
     return crc;
 }
 
-/* ==================== 保存 ==================== */
+/* 配置表 EEPROM 偏移 -> 字节值 (无大 buf, 供逐字节保存/CRC) */
+static uint8_t cfg_byte_at(const config_table_t *cfg, uint16_t off)
+{
+    uint8_t i;
+    if (off == CFG_OFF_MAGIC) return CFG_MAGIC;
+    if (off == CFG_OFF_VERSION) return CFG_VERSION;
+    if (off >= CFG_OFF_RF && off < CFG_OFF_RF + RF_CFG_N) return cfg->rf_cfg[off - CFG_OFF_RF];
+    if (off >= CFG_OFF_CONTENT && off < CFG_OFF_CONTENT + 32) return cfg->tx_content[off - CFG_OFF_CONTENT];
+    if (off >= CFG_OFF_CI2 && off < CFG_OFF_CI2 + 32) return cfg->tx_ci2[off - CFG_OFF_CI2];
+    if (off >= CFG_OFF_ENA && off < CFG_OFF_ENA + 32) return cfg->tx_ena[off - CFG_OFF_ENA];
+    if (off >= CFG_OFF_PERIODL && off < CFG_OFF_PERIODL + 64) {
+        i = (uint8_t)((off - CFG_OFF_PERIODL) >> 1);
+        return ((off - CFG_OFF_PERIODL) & 1) ? (uint8_t)(cfg->tx_period_l[i] >> 8)
+                                             : (uint8_t)(cfg->tx_period_l[i] & 0xFF);
+    }
+    if (off >= CFG_OFF_PERIODH && off < CFG_OFF_PERIODH + 64) {
+        i = (uint8_t)((off - CFG_OFF_PERIODH) >> 1);
+        return ((off - CFG_OFF_PERIODH) & 1) ? (uint8_t)(cfg->tx_period_h[i] >> 8)
+                                             : (uint8_t)(cfg->tx_period_h[i] & 0xFF);
+    }
+    if (off == CFG_OFF_SELF) return cfg->self_addr;
+    if (off == CFG_OFF_PEER) return cfg->peer_addr;
+    if (off == CFG_OFF_MODE) return cfg->rf_mode;
+    if (off == CFG_OFF_ROLE) return cfg->rf_role;
+    if (off == CFG_OFF_FREQ_LO) return (uint8_t)(cfg->rf_freq & 0xFF);
+    if (off == CFG_OFF_FREQ_LO + 1) return (uint8_t)((cfg->rf_freq >> 8) & 0xFF);
+    if (off == CFG_OFF_FREQ_HI) return (uint8_t)((cfg->rf_freq >> 16) & 0xFF);
+    if (off == CFG_OFF_FREQ_HI + 1) return (uint8_t)((cfg->rf_freq >> 24) & 0xFF);
+    if (off == CFG_OFF_SF) return cfg->rf_sf;
+    if (off == CFG_OFF_BW) return (uint8_t)(cfg->rf_bw & 0xFF);
+    if (off == CFG_OFF_BW + 1) return (uint8_t)(cfg->rf_bw >> 8);
+    if (off == CFG_OFF_CR) return cfg->rf_cr;
+    if (off == CFG_OFF_POWER) return cfg->rf_power;
+    if (off == CFG_OFF_PREAMBLE) return cfg->rf_preamble;
+    if (off == CFG_OFF_SYNCWORD) return cfg->rf_syncword;
+    if (off == CFG_OFF_LNA) return cfg->rf_lna;
+    if (off == CFG_OFF_FE_LO) return (uint8_t)(cfg->fe_value & 0xFF);
+    if (off == CFG_OFF_FE_HI) return (uint8_t)(((uint16_t)cfg->fe_value) >> 8);
+    if (off == CFG_OFF_FE_EN) return cfg->fe_enable;
+    if (off == CFG_OFF_U1_BDL) return (uint8_t)(cfg->uart1_baud & 0xFF);
+    if (off == CFG_OFF_U1_BDH) return (uint8_t)(cfg->uart1_baud >> 8);
+    if (off == CFG_OFF_U1_BMAX) return cfg->uart1_buf_max;
+    if (off == CFG_OFF_U1_TOL) return (uint8_t)(cfg->uart1_timeout & 0xFF);
+    if (off == CFG_OFF_U1_TOH) return (uint8_t)(cfg->uart1_timeout >> 8);
+    if (off == CFG_OFF_U1_EN) return cfg->uart1_en;
+    return 0;
+}
+
+/* ==================== 保存 (无大 buf, 逐字节写, 避免栈溢出) ==================== */
 uint8_t config_save(const config_table_t *cfg)
 {
-    uint8_t buf[CFG_LEN];
-    uint8_t i;
-
-    buf[CFG_OFF_MAGIC]   = CFG_MAGIC;
-    buf[CFG_OFF_VERSION] = CFG_VERSION;
-
-    /* 射频白名单 */
-    for (i = 0; i < RF_CFG_N; i++)
-        buf[CFG_OFF_RF + i] = cfg->rf_cfg[i];
-
-    /* 发射任务表: CONTENT(CI₁)(32)+CI2(32)+ENA(32)+PERIOD_L(64)+PERIOD_H(64), 小端 */
-    for (i = 0; i < 32; i++) {
-        buf[CFG_OFF_CONTENT + i]        = cfg->tx_content[i];
-        buf[CFG_OFF_CI2 + i]            = cfg->tx_ci2[i];
-        buf[CFG_OFF_ENA + i]            = cfg->tx_ena[i];
-        buf[CFG_OFF_PERIODL + i * 2]     = (uint8_t)(cfg->tx_period_l[i] & 0xFF);
-        buf[CFG_OFF_PERIODL + i * 2 + 1] = (uint8_t)(cfg->tx_period_l[i] >> 8);
-        buf[CFG_OFF_PERIODH + i * 2]     = (uint8_t)(cfg->tx_period_h[i] & 0xFF);
-        buf[CFG_OFF_PERIODH + i * 2 + 1] = (uint8_t)(cfg->tx_period_h[i] >> 8);
-    }
-
-    /* 本机/对端地址 + 收发模式 + 主从位 */
-    buf[CFG_OFF_SELF] = cfg->self_addr;
-    buf[CFG_OFF_PEER] = cfg->peer_addr;
-    buf[CFG_OFF_MODE] = cfg->rf_mode;
-    buf[CFG_OFF_ROLE] = cfg->rf_role;
-
-    /* RF 高层参数: 频率(32bit 小端) + SF/BW/CR/功率/前导/同步/LNA */
-    buf[CFG_OFF_FREQ_LO] = (uint8_t)(cfg->rf_freq & 0xFF);
-    buf[CFG_OFF_FREQ_LO + 1] = (uint8_t)((cfg->rf_freq >> 8) & 0xFF);
-    buf[CFG_OFF_FREQ_HI] = (uint8_t)((cfg->rf_freq >> 16) & 0xFF);
-    buf[CFG_OFF_FREQ_HI + 1] = (uint8_t)((cfg->rf_freq >> 24) & 0xFF);
-    buf[CFG_OFF_SF]      = cfg->rf_sf;
-    buf[CFG_OFF_BW]      = cfg->rf_bw;
-    buf[CFG_OFF_CR]      = cfg->rf_cr;
-    buf[CFG_OFF_POWER]   = cfg->rf_power;
-    buf[CFG_OFF_PREAMBLE]= cfg->rf_preamble;
-    buf[CFG_OFF_SYNCWORD]= cfg->rf_syncword;
-    buf[CFG_OFF_LNA]     = cfg->rf_lna;
-
-    /* 频偏校正值(有符号 Hz, 小端) + 校正开关 */
-    buf[CFG_OFF_FE_LO] = (uint8_t)(cfg->fe_value & 0xFF);
-    buf[CFG_OFF_FE_HI] = (uint8_t)(((uint16_t)cfg->fe_value) >> 8);
-    buf[CFG_OFF_FE_EN] = cfg->fe_enable;
-
-    /* UART1 485: 波特率(u16) + 缓冲上限 + 组帧超时(u16) + 使能 */
-    buf[CFG_OFF_U1_BDL]  = (uint8_t)(cfg->uart1_baud & 0xFF);
-    buf[CFG_OFF_U1_BDH]  = (uint8_t)(cfg->uart1_baud >> 8);
-    buf[CFG_OFF_U1_BMAX] = cfg->uart1_buf_max;
-    buf[CFG_OFF_U1_TOL]  = (uint8_t)(cfg->uart1_timeout & 0xFF);
-    buf[CFG_OFF_U1_TOH]  = (uint8_t)(cfg->uart1_timeout >> 8);
-    buf[CFG_OFF_U1_EN]   = cfg->uart1_en;
-
+    uint16_t i;
+    uint8_t crc = 0x00;
     /* CRC-8 覆盖 [0..263] */
-    buf[CFG_OFF_CRC] = config_compute_crc(buf, CFG_OFF_CRC);
-
-    /* 写入 (内部 unlock/lock; 仅写有变化的字节) */
-    eeprom_update_block(0, buf, CFG_LEN);
+    for (i = 0; i < CFG_OFF_CRC; i++)
+        crc = config_crc8(crc, cfg_byte_at(cfg, i));
+    /* 逐字节写 (EEPROM_update 只写变化字节) */
+    for (i = 0; i < CFG_OFF_CRC; i++)
+        EEPROM_update(i, cfg_byte_at(cfg, i));
+    EEPROM_update(CFG_OFF_CRC, crc);
     return 1;
 }
 
@@ -185,7 +184,8 @@ uint8_t config_load(config_table_t *cfg)
                  | ((uint32_t)EEPROM_read(CFG_OFF_FREQ_HI) << 16)
                  | ((uint32_t)EEPROM_read(CFG_OFF_FREQ_HI + 1) << 24);
     cfg->rf_sf       = EEPROM_read(CFG_OFF_SF);
-    cfg->rf_bw       = EEPROM_read(CFG_OFF_BW);
+    cfg->rf_bw       = (uint16_t)EEPROM_read(CFG_OFF_BW)
+                     | ((uint16_t)EEPROM_read(CFG_OFF_BW + 1) << 8);
     cfg->rf_cr       = EEPROM_read(CFG_OFF_CR);
     cfg->rf_power    = EEPROM_read(CFG_OFF_POWER);
     cfg->rf_preamble = EEPROM_read(CFG_OFF_PREAMBLE);
@@ -223,10 +223,7 @@ uint8_t config_valid(void)
 /* ==================== 清除 (恢复出厂, 擦回 0xFF) ==================== */
 void config_clear(void)
 {
-    uint8_t buf[CFG_LEN];
-    uint8_t i;
-
+    uint16_t i;
     for (i = 0; i < CFG_LEN; i++)
-        buf[i] = 0xFF;
-    eeprom_update_block(0, buf, CFG_LEN);
+        EEPROM_write(i, 0xFF);   /* 逐字节, 无大 buf, 避免栈溢出 */
 }
