@@ -39,4 +39,7 @@ void rf_app_test_tx(void);
 uint8_t rf_app_get_link(void);
 uint8_t rf_app_get_state(void);
 
+/* 复位 RUN 灯闪烁状态 (每次重新进入模式3时调用, 从"先常亮"重新开始) */
+void rf_app_run_reset(void);
+
 #endif /* __RF_APP_H */

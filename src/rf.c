@@ -23,6 +23,17 @@
 #define RF_CR           5            /* 编码率 5..8 (= 4/5..4/8) */
 #define RF_POWER_DBM    13           /* 发射功率 dBm */
 
+/* ==================== FSK 参数 (UART3_RF_RADIO=1 时生效) ====================
+ * 默认值对应"极限速率留 0.5 余地" (极限 ~200kbps -> 100kbps)
+ * 可被 0x60~0x7F 直写 SX1278 0x02~0x1F 覆盖 (BitRate/Fdev/RxBw 等)
+ */
+#define RF_FSK_BITRATE   100000UL    /* BitRate bps */
+#define RF_FSK_FDEV      50000UL     /* Fdev Hz */
+#define RF_FSK_RXBW      200000UL    /* RxBw Hz */
+#define RF_FSK_SYNC      0xC1        /* FSK 同步字节 (SYNCVALUE1) */
+#define RF_FSK_FIXED     0           /* 包格式: 0=可变 1=固定 */
+#define RF_FSK_CRC       1           /* CRC: 1=开 0=关 */
+
 /* ==================== SX1278 寄存器 ==================== */
 #define REG_FIFO            0x00
 #define REG_OPMODE          0x01
@@ -62,6 +73,38 @@
 #define REG_IMAGECAL        0x3B   /* FSK 模式 0x3B=IMAGECAL */
 #define REG_SYNC_WORD       0x39
 #define REG_VERSION         0x42
+
+/* ---- FSK 模式专属寄存器 (LoRa 模式这些地址语义不同) ---- */
+#define REG_BITRATEMSB      0x02
+#define REG_BITRATELSB      0x03
+#define REG_FDEVMSB         0x04
+#define REG_FDEVLSB         0x05
+#define REG_RXCONFIG        0x0D
+#define REG_RSSIVALUE       0x11
+#define REG_RXBW            0x12
+#define REG_AFCBW           0x13
+#define REG_PREAMBLEMSB_FSK 0x25
+#define REG_PREAMBLELSB_FSK 0x26
+#define REG_SYNCCONFIG      0x27
+#define REG_SYNCVALUE1      0x28
+#define REG_PACKETCONFIG1   0x30
+#define REG_PACKETCONFIG2   0x31
+#define REG_PAYLOADLEN_FSK  0x32
+#define REG_NODEADRS        0x33
+#define REG_BROADCASTADRS   0x34
+#define REG_IRQFLAGS1       0x3E
+#define REG_IRQFLAGS2       0x3F
+#define REG_DIOMAPPING1     0x40
+#define REG_DIOMAPPING2     0x41
+
+/* FSK IRQ 标志 (IRQFLAGS2=0x3F) */
+#define FSK_IRQ2_PACKETSENT   0x08
+#define FSK_IRQ2_PAYLOADREADY 0x04
+#define FSK_IRQ2_CRCOK        0x02
+#define FSK_IRQ2_FIFOOVERRUN  0x10
+/* FSK IRQ 标志 (IRQFLAGS1=0x3E) */
+#define FSK_IRQ1_PREAMBLEDETECT 0x02
+#define FSK_IRQ1_SYNCADDRMATCH  0x01
 
 /* OPMODE 位 */
 #define OPMODE_LONGRANGE    0x80   /* LoRa 模式 */
@@ -190,6 +233,92 @@ static void rf_rx_start(void)
     rf_set_opmode(OPMODE_RXCONT);
 }
 
+/* ==================== FSK RxBw 寄存器值查表 ==================== */
+static uint8_t rf_fsk_bw_reg(uint32_t bw)
+{
+    /* {带宽Hz, RegValue} (参考 Semtech FskBandwidths 表) */
+    static const uint16_t bw_tbl[][2] = {
+        {2600,0x17},{3100,0x0F},{3900,0x07},{5200,0x16},{6300,0x0E},{7800,0x06},
+        {10400,0x15},{12500,0x0D},{15600,0x05},{20800,0x14},{25000,0x0C},{31300,0x04},
+        {41700,0x13},{50000,0x0B},{62500,0x03},{83333,0x12},{100000,0x0A},{125000,0x02},
+        {166700,0x11},{200000,0x09},{250000,0x01},
+    };
+    uint8_t i;
+    for (i = 0; i < 21; i++)
+        if (bw <= bw_tbl[i][0]) return (uint8_t)bw_tbl[i][1];
+    return 0x00;   /* 超出 -> 最大带宽 */
+}
+
+/* ==================== FSK 进 RX (轻量) ====================
+ * DIO0=PayloadReady(00), DIO2=SyncAddr(11); AFCAUTO+AGCAUTO+RxTrig=PreambleDetect
+ * (参考 Semtech SX1276SetRx FSK 分支)
+ */
+static void rf_fsk_rx_start(void)
+{
+    rf_set_opmode(OPMODE_STDBY);
+    rf_write_reg(REG_DIOMAPPING1, 0x0C);   /* DIO2=11 SyncAddr, DIO0/1=00 */
+    rf_write_reg(REG_DIOMAPPING2, 0x30);   /* DIO5=ModeReady */
+    rf_write_reg(REG_RXCONFIG, 0x1E);      /* AFCAUTO|AGCAUTO|RxTrigPreambleDetect */
+    rf_write_reg(REG_IRQFLAGS1, 0xFF);     /* 清 FSK 中断 */
+    rf_write_reg(REG_IRQFLAGS2, 0xFF);
+    rf_set_opmode(OPMODE_RXCONT);
+}
+
+/* ==================== FSK 模式配置 (UART3_RF_RADIO=1) ====================
+ * 物理参数(BitRate/Fdev/RxBw)用宏默认, 可被 0x60~0x7F 直写 SX1278 0x02~0x1F 覆盖
+ */
+static void rf_fsk_apply_config(void)
+{
+    uint16_t br, fdev;
+    uint8_t pc1;
+
+    /* 切 FSK: Sleep -> 清 LONGRANGE -> STDBY */
+    rf_write_reg(REG_OPMODE, 0x00);   /* Sleep (FSK) */
+    rf_delay(500);
+    rf_write_reg(REG_OPMODE, 0x01);   /* STDBY FSK (无 LONGRANGE) */
+    rf_delay(500);
+
+    rf_set_frequency(UART3_RF_FREQ);
+
+    /* BitRate = 32MHz / BR */
+    br = (uint16_t)(32000000UL / RF_FSK_BITRATE);
+    rf_write_reg(REG_BITRATEMSB, (uint8_t)(br >> 8));
+    rf_write_reg(REG_BITRATELSB, (uint8_t)(br & 0xFF));
+    /* Fdev = Fdev / 61.035 */
+    fdev = (uint16_t)(RF_FSK_FDEV / 61UL);
+    rf_write_reg(REG_FDEVMSB, (uint8_t)(fdev >> 8));
+    rf_write_reg(REG_FDEVLSB, (uint8_t)(fdev & 0xFF));
+    /* RxBw + AfcBw */
+    rf_write_reg(REG_RXBW,  rf_fsk_bw_reg(RF_FSK_RXBW));
+    rf_write_reg(REG_AFCBW, rf_fsk_bw_reg(RF_FSK_RXBW));
+
+    /* PA + LNA */
+    rf_write_reg(REG_PA_CONFIG, 0x80 | (UART3_RF_POWER & 0x0F));
+    rf_write_reg(REG_LNA, UART3_RF_LNA);
+
+    /* 前导 (FSK 0x25/0x26) */
+    rf_write_reg(REG_PREAMBLEMSB_FSK, (uint8_t)(UART3_RF_PREAMBLE >> 8));
+    rf_write_reg(REG_PREAMBLELSB_FSK, (uint8_t)(UART3_RF_PREAMBLE & 0xFF));
+
+    /* 包格式: PACKETCONFIG1 = 包格式(可变/固定) + CRC */
+    pc1 = (uint8_t)((RF_FSK_FIXED ? 0x00 : 0x80) | (RF_FSK_CRC ? 0x10 : 0x00));
+    rf_write_reg(REG_PACKETCONFIG1, pc1);
+    rf_write_reg(REG_PACKETCONFIG2, 0x40);   /* DATAMODE_PACKET */
+    /* 载荷长度: 固定包=RF_RX_MAX, 可变包=0xFF(最大) */
+    rf_write_reg(REG_PAYLOADLEN_FSK, RF_FSK_FIXED ? RF_RX_MAX : 0xFF);
+
+    /* 同步字: SYNCCONFIG = SYNC_ON + 1字节(SYNCSIZE=0), 同步字节用 UART3_RF_SYNCWORD */
+    rf_write_reg(REG_SYNCCONFIG, 0x10);
+    rf_write_reg(REG_SYNCVALUE1, UART3_RF_SYNCWORD);
+    /* 节点/广播地址过滤关闭 (参考驱动默认) */
+    rf_write_reg(REG_NODEADRS, 0x00);
+    rf_write_reg(REG_BROADCASTADRS, 0x00);
+
+    /* 进 FSK RXCONT */
+    rf_fsk_rx_start();
+    RF_ENABLED = 1;
+}
+
 /* ==================== 按配置应用 RF 参数 ====================
  * 按 UART3_RF_* (0x30~0x38, 可存 EEPROM) 配置 SX1278: 载波频率 + 调制(SF/BW/CR) +
  * 功率 + 前导 + 同步字 + LNA, 然后进 RXCONT。空速由 SF/BW/CR 自动算。
@@ -197,6 +326,11 @@ static void rf_rx_start(void)
 void rf_apply_config(void)
 {
     uint8_t bw_code, cr_code, sf_code, mc1, mc2;
+
+    if (UART3_RF_RADIO) {              /* FSK 模式 (0x2F=1) */
+        rf_fsk_apply_config();
+        return;
+    }
 
     /* 载波频率 */
     rf_set_frequency(UART3_RF_FREQ);
@@ -339,13 +473,22 @@ uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
 
     RF_SPI_BUSY++;                  /* 长事务占用 SPI (计数), TIM4 轮询让路 */
     rf_set_opmode(OPMODE_STDBY);
-    rf_write_reg(REG_IRQ_FLAGS_MASK, 0x17);   /* 关键: 允许 TxDone, 否则 rf_poll 等不到 */
-    rf_write_reg(REG_IRQ_FLAGS, 0xFF);  /* 清中断标志 */
-    rf_write_reg(REG_FIFO_TX_BASE, 0x80);
-    rf_write_reg(REG_FIFO_ADDR_PTR, 0x80);
-    for (i = 0; i < len; i++)
-        rf_write_reg(REG_FIFO, buf[i]);
-    rf_write_reg(REG_PAYLOAD_LENGTH, len);
+    if (UART3_RF_RADIO) {
+        /* FSK: 无 FIFO 基址, 直接 REG_FIFO; 清 FSK 中断 */
+        rf_write_reg(REG_IRQFLAGS1, 0xFF);
+        rf_write_reg(REG_IRQFLAGS2, 0xFF);
+        for (i = 0; i < len; i++)
+            rf_write_reg(REG_FIFO, buf[i]);
+        rf_write_reg(REG_PAYLOADLEN_FSK, len);
+    } else {
+        rf_write_reg(REG_IRQ_FLAGS_MASK, 0x17);   /* 关键: 允许 TxDone, 否则 rf_poll 等不到 */
+        rf_write_reg(REG_IRQ_FLAGS, 0xFF);  /* 清中断标志 */
+        rf_write_reg(REG_FIFO_TX_BASE, 0x80);
+        rf_write_reg(REG_FIFO_ADDR_PTR, 0x80);
+        for (i = 0; i < len; i++)
+            rf_write_reg(REG_FIFO, buf[i]);
+        rf_write_reg(REG_PAYLOAD_LENGTH, len);
+    }
     rf_set_opmode(OPMODE_TX);         /* 进入 TX (此后 TxDone 由 TIM4 轮询收尾) */
     RF_SPI_BUSY--;                    /* 释放 (内部各步 spi_begin/end 已 ++/--) */
 
@@ -362,7 +505,8 @@ uint8_t rf_tx_start(const uint8_t *buf, uint8_t len)
 void rf_abort_tx(void)
 {
     RF_TX_BUSY = 0;
-    rf_rx_start();
+    if (UART3_RF_RADIO) rf_fsk_rx_start();
+    else                rf_rx_start();
 }
 
 /* ==================== TIM4 ISR 轮询 ====================
@@ -381,20 +525,63 @@ void rf_poll(void)
      * 发送 SPI 事务先完成, 之后 SPI 空闲再搬 -> 时序不乱 + 不丢数据 */
     if (!RF_ENABLED || RF_SPI_BUSY) return;
 
-    /* 发送忙: 直接轮询 IRQ_FLAGS 查 TxDone (不依赖 DIO0 的 TX 模式映射,
+    /* 发送忙: 直接轮询查 TxDone/PacketSent (不依赖 DIO0 的 TX 模式映射,
      * 实测 DIO0 发送完成后不拉高 -> 卡 RF_TX_BUSY + 卡 TX 模式不接收) */
     if (RF_TX_BUSY) {
-        flags = rf_read_reg(REG_IRQ_FLAGS);
-        if (flags & IRQ_TX_DONE) {            /* 发送完成 */
-            rf_write_reg(REG_IRQ_FLAGS, 0xFF);
-            RF_TX_BUSY = 0;
-            RF_TX_DONE = 1;
-            rf_rx_start();                    /* 发完回接收(含 I/Q/ERRATA/mask 配置) */
+        if (UART3_RF_RADIO) {
+            flags = rf_read_reg(REG_IRQFLAGS2);      /* FSK: PacketSent 在 IRQFLAGS2 */
+            if (flags & FSK_IRQ2_PACKETSENT) {       /* 发送完成 */
+                rf_write_reg(REG_IRQFLAGS1, 0xFF);
+                rf_write_reg(REG_IRQFLAGS2, 0xFF);
+                RF_TX_BUSY = 0;
+                RF_TX_DONE = 1;
+                rf_fsk_rx_start();                   /* 发完回接收 */
+            }
+        } else {
+            flags = rf_read_reg(REG_IRQ_FLAGS);
+            if (flags & IRQ_TX_DONE) {               /* 发送完成 */
+                rf_write_reg(REG_IRQ_FLAGS, 0xFF);
+                RF_TX_BUSY = 0;
+                RF_TX_DONE = 1;
+                rf_rx_start();                       /* 发完回接收(含 I/Q/ERRATA/mask 配置) */
+            }
         }
         return;
     }
 
     if (!(GPIOH->IDR & 0x20)) return;         /* 非发送: DIO0(PH5) 低无事件 */
+
+    if (UART3_RF_RADIO) {
+        /* ---- FSK 收包 (IRQFLAGS2 PayloadReady) ---- */
+        flags = rf_read_reg(REG_IRQFLAGS2);
+        if (flags & FSK_IRQ2_PAYLOADREADY) {
+            uint8_t n, i;
+            if ((rf_read_reg(REG_IRQFLAGS2) & FSK_IRQ2_CRCOK)) {
+                n = rf_read_reg(REG_PAYLOADLEN_FSK);   /* 可变包: 硬件更新实际长度 */
+                if (n > RF_RX_MAX) n = RF_RX_MAX;
+                {
+                    uint8_t nxt = (uint8_t)(RF_RX_Q_WR + 1) % RF_RX_QUEUE;
+                    if (nxt == RF_RX_Q_RD) {
+                        RF_RX_OVF = 1;                 /* 环形缓冲满: 溢出 */
+                    } else {
+                        RF_RX_Q[RF_RX_Q_WR].len = n;
+                        for (i = 0; i < n; i++)
+                            RF_RX_Q[RF_RX_Q_WR].data[i] = rf_read_reg(REG_FIFO);
+                        RF_RX_Q[RF_RX_Q_WR].rssi = (int8_t)(-((int16_t)rf_read_reg(REG_RSSIVALUE) >> 1));
+                        RF_RX_Q[RF_RX_Q_WR].snr  = 0;  /* FSK 无 SNR */
+                        RF_RX_Q_WR = nxt;
+                    }
+                }
+            } else {
+                RF_APP_CRC_CNT++;                      /* 统计: CRC 错帧 */
+            }
+            rf_write_reg(REG_IRQFLAGS1, 0xFF);
+            rf_write_reg(REG_IRQFLAGS2, 0xFF);
+            rf_fsk_rx_start();                         /* 回接收 */
+        }
+        return;
+    }
+
     flags = rf_read_reg(REG_IRQ_FLAGS);
 
     if (flags & IRQ_RX_DONE) {                /* 收到一包: 快速搬入环形缓冲(不解析) */

@@ -40,9 +40,11 @@
 #define CI_WORDLEN  0x02
 #define CI_COMPRESS 0x01
 
-/* SYSTEM_LED = PH1 (高电平点亮) */
+/* SYSTEM_LED = PH1 (高电平点亮); RUN_LED = PA6 (模式3 正常收发活动闪烁) */
 #define RF_LED_SYS_ON()  (GPIOH->ODR |= 0x02)
 #define RF_LED_SYS_OFF() (GPIOH->ODR &= (uint8_t)~0x02)
+#define RF_LED_RUN_ON()  (GPIOA->ODR |= 0x40)
+#define RF_LED_RUN_OFF() (GPIOA->ODR &= (uint8_t)~0x40)
 
 /* 模式3 主从: 0=从机 1=主机 (doc/upperpc.md 0x19) */
 #define RF_ROLE_SLAVE  0
@@ -73,6 +75,8 @@ volatile uint16_t RF_APP_CRC_CNT    = 0;   /* CRC 错帧计数 (rf.c 递增) */
 volatile uint8_t  RF_APP_FE_REQUEST = 0;   /* 频偏校正请求 (uart3 0x26 触发) */
 static volatile uint8_t RF_OUT_UPDATED = 0;  /* ISR 解包已更新输出内存 */
 static volatile uint8_t RF_ACK_PENDING = 0;  /* 异步收发: 收到帧待应答 */
+static volatile uint8_t RF_RUN_ACT = 0;      /* 本周期有 RF 收发活动 (模式3 RUN 灯用) */
+static uint8_t RF_RUN_EVER = 0;              /* 模式3 是否已发生 RF 活动 (RUN 灯: 活动前常亮) */
 
 /* 模式3 主机状态机 */
 static uint8_t  RF_M3_STATE;        /* 主机: 0=待发 1=等回包 */
@@ -112,6 +116,14 @@ static void rf_led_refresh(void)
             DBG_NL();
         }
     }
+}
+
+/* RUN LED: 有 RF 活动(收发一帧)翻转一次, 无活动保持 (模式3 活动指示) */
+static void rf_led_run_toggle(void)
+{
+    static uint8_t run_led_on = 0;
+    run_led_on ^= 1;
+    if (run_led_on) RF_LED_RUN_ON(); else RF_LED_RUN_OFF();
 }
 
 /* 各发送任务上次发射时刻(ms): 模式1 用 [0], 模式4 用全表 */
@@ -285,6 +297,13 @@ void rf_app_test_tx(void)
 uint8_t rf_app_get_link(void)  { return RF_M3_LINK; }
 uint8_t rf_app_get_state(void) { return RF_M3_STATE; }
 
+/* 复位 RUN 灯闪烁状态: 每次重新进入模式3时调用 (从"先常亮"重新开始) */
+void rf_app_run_reset(void)
+{
+    RF_RUN_EVER = 0;
+    RF_RUN_ACT = 0;
+}
+
 /* ==================== 发送 RF 命令帧 (content=1) ====================
  * 净负荷 = [地址] + 帧; 命令帧 = [地址][0b00110111][0 CCCCCCC], 3 字节
  * (doc/frame.md: 地址在帧前面, 帧本身无地址)
@@ -425,6 +444,7 @@ void rf_app_poll(void)
         RF_TX_DONE = 0;
         if (RF_APP_OVERFLOW) RF_APP_OVERFLOW--;
         /* DBG_STR("[D]txdone ovf="); DBG_DEC(RF_APP_OVERFLOW); DBG_NL();  高频, 注释减少刷屏 */
+        RF_RUN_ACT = 1;             /* RUN: 有发送活动 */
         rf_led_refresh();   /* 堆叠/溢出/报警 统一刷新 */
     }
 
@@ -437,7 +457,14 @@ void rf_app_poll(void)
             RF_LAST_RSSI = rr;
             RF_LAST_SNR  = rs;
             rf_app_rx_isr(rbuf, rlen);   /* 解包更新输出内存 */
+            RF_RUN_ACT = 1;              /* RUN: 有接收活动 */
         }
+    }
+    /* 从机回传 (联通测试/通用): 收到主站遥测帧即回传一帧 (UART3_SLAVE_RET_CI)
+     * 模式3 中 poll 先于此清 RF_M3_RX_EVT 并回传, run 内从机回传不会重复 */
+    if (UART3_RF_ROLE == RF_ROLE_SLAVE && RF_M3_RX_EVT && !RF_TX_BUSY) {
+        RF_M3_RX_EVT = 0;
+        rf_send_slave(UART3_SLAVE_RET_CI);   /* 回传主站要求的内容 */
     }
     /* 3. 接收应用: 解包已更新输出内存, 同步硬件 */
     if (RF_OUT_UPDATED) {
@@ -481,6 +508,19 @@ void rf_app_run(void)
     uint8_t i;
 
     DBG_POS(1);   /* 位置码: rf_app_run 入口 */
+
+    /* RUN 灯 (仅模式3): 第一次 RF 活动前常亮, 活动后随收发翻转闪烁 */
+    {
+        uint8_t act = RF_RUN_ACT;
+        RF_RUN_ACT = 0;                 /* 清本周期活动标志 */
+        if (!RF_RUN_EVER) {
+            RF_LED_RUN_ON();            /* 活动前: 常亮 */
+            if (act) RF_RUN_EVER = 1;   /* 第一次 RF 活动: 转闪烁 */
+        } else if (act) {
+            rf_led_run_toggle();        /* 活动后: 随收发翻转 */
+        }
+    }
+
 
 #ifdef RF_DEBUG
     {   /* 低频统计(每2s一行): 时间戳 + 收帧率 + RF 发送占用率(性能剩余)
@@ -613,8 +653,9 @@ void rf_app_run(void)
                 RF_M3_STATE = 0;   /* 收到回包 -> 下周期再发 */
             } else if (!RF_TX_BUSY &&
                        (uint16_t)(TICK_MS - RF_M3_LAST_TX_MS) >= RF_M3_RETRY_TIMEOUT_MS) {
-                /* 超时无回包 -> 重发同一帧 */
+                /* 超时无回包 -> 断连重试: SYS 灯亮 (恢复断链后 rx_isr 清 alarm -> 灭) */
                 RF_M3_RETRY_CNT++;
+                RF_LINK_ALARM = 1;
                 if (RF_M3_RETRY_CNT >= RF_M3_RETRY_MAX) {
                     RF_M3_LINK = 0;
                     RF_LINK_TRY_MS = TICK_MS;
