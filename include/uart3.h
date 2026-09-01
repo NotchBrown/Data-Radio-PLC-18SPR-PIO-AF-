@@ -11,6 +11,7 @@
 #define __UART3_H
 
 #include <stdint.h>
+#include "config.h"   /* FSK_CFG_N / FSK_IDX_* (UART3_FSK 声明用) */
 
 /* 初始化: 115200 8N1 + RX 中断 + 状态机复位 */
 void uart3_init(void);
@@ -60,6 +61,12 @@ extern uint8_t  UART3_RF_POWER;    /* 发射功率 dBm (0x35) */
 extern uint8_t  UART3_RF_PREAMBLE; /* 前导码 (0x36) */
 extern uint8_t  UART3_RF_SYNCWORD; /* 同步字 (0x37) */
 extern uint8_t  UART3_RF_LNA;      /* LNA 增益 (0x38) */
+
+/* 长距离模式 (0x3F, 存 EEPROM; 1=放大 RF 超时) */
+extern uint8_t  UART3_LONG_RANGE;
+
+/* FSK 快照 (持久化; 索引见 config.h FSK_IDX_*) */
+extern uint8_t  UART3_FSK[FSK_CFG_N];
 
 /* 频偏校正 (控制指令 0x26~0x28, 单位 Hz; 默认关闭) */
 extern int16_t UART3_FE_VALUE;    /* 校正值 (Hz, 0x27, 存 EEPROM) */

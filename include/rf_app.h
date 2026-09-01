@@ -32,8 +32,15 @@ extern volatile uint16_t RF_APP_TX_CNT;     /* 发送帧计数 (含握手/重传
 extern volatile uint16_t RF_APP_CRC_CNT;    /* CRC 错帧计数 (rf.c 递增) */
 extern volatile uint8_t  RF_APP_FE_REQUEST; /* 频偏校正请求 (uart3 0x26 触发) */
 
-/* 发送测试帧 (控制指令 0x20): 用发送表[0] 内容指示发一帧 */
+/* 往返测试 (控制指令 0x20): 阻塞式一次完整往返——
+ * 主站发任务0帧等从站回包, 结果写 RF_RTT_MS; 超时写 0xFFFF。 */
 void rf_app_test_tx(void);
+
+/* 真实回路往返时间 (ms); 0xFFFF=未测/未就绪. 0x20 写触发, 读返回. */
+extern volatile uint16_t RF_RTT_MS;
+
+/* RF 超时按 长距离模式 切换: long_range=1 用更长超时(按完整超帧往返放大), 0 用高速默认 */
+void rf_set_timeouts(uint8_t long_range);
 
 /* 内部状态只读 (快照/诊断 0x2B~0x2C): 通联标志 / 主状态机 */
 uint8_t rf_app_get_link(void);
