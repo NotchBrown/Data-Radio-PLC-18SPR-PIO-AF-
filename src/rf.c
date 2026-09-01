@@ -241,13 +241,13 @@ static uint8_t rf_fsk_bw_reg(uint32_t bw)
 {
     /* {甯﹀Hz, RegValue} (鍙傝€?Semtech FskBandwidths 琛? */
     static const uint16_t bw_tbl[][2] = {
-        {2600,0x17},{3100,0x0F},{3900,0x07},{5200,0x16},{6300,0x0E},{7800,0x06},
+        {500000,0x00},{2600,0x17},{3100,0x0F},{3900,0x07},{5200,0x16},{6300,0x0E},{7800,0x06},
         {10400,0x15},{12500,0x0D},{15600,0x05},{20800,0x14},{25000,0x0C},{31300,0x04},
         {41700,0x13},{50000,0x0B},{62500,0x03},{83333,0x12},{100000,0x0A},{125000,0x02},
-        {166700,0x11},{200000,0x09},{250000,0x01},
+        {166700,0x11},{200000,0x09},{250000,0x01},{500000,0x00},  /* 0x00 官方标Invalid(500k), 测试用 */
     };
     uint8_t i;
-    for (i = 0; i < 21; i++)
+    for (i = 0; i < 22; i++)
         if (bw <= bw_tbl[i][0]) return (uint8_t)bw_tbl[i][1];
     return 0x00;   /* 瓒呭嚭 -> 鏈€澶у甫瀹?*/
 }
@@ -340,6 +340,11 @@ void rf_apply_config(void)
         rf_fsk_apply_config();
         return;
     }
+
+    /* 鍒囧埌 LoRa 妯″紡: Sleep + LongRange + STDBY (纭繚浠?FSK 鍒囧洖鏃?OPMODE bit7=LONGRANGE) */
+    rf_write_reg(REG_OPMODE, 0x00);                             /* Sleep (FSK) */
+    rf_write_reg(REG_OPMODE, OPMODE_LONGRANGE | OPMODE_SLEEP);  /* Sleep + LongRange (LoRa) */
+    rf_set_opmode(OPMODE_STDBY);
 
     /* 杞芥尝棰戠巼 */
     rf_set_frequency(UART3_RF_FREQ);
