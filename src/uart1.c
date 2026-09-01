@@ -84,7 +84,7 @@ void UART1_RX_IRQHandler(void) __interrupt(ITC_IRQ_UART1_RX)
         UART1_RX_BUF[UART1_RX_LEN++] = b;
         if (UART1_RX_LEN >= UART1_BUF_MAX) UART1_RX_FULL = 1;
     }
-    UART1_RX_LAST_MS = rtc_get_ms();
+    UART1_RX_LAST_MS = TICK_MS;
 }
 
 /* ==================== UART1 发送中断 (向量17) ====================
@@ -102,7 +102,7 @@ uint8_t uart1_has_frame(void)
     if (!UART1_ENABLED) return 0;
     if (UART1_RX_LEN == 0) return 0;
     if (UART1_RX_FULL) return 1;                       /* 缓冲满 */
-    idle = (uint16_t)(rtc_get_ms() - UART1_RX_LAST_MS);
+    idle = (uint16_t)(TICK_MS - UART1_RX_LAST_MS);
     if (idle >= UART1_TIMEOUT) return 1;               /* 组帧超时 */
     return 0;
 }

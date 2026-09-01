@@ -54,7 +54,6 @@
 
 /* 模式3 停等协议 (第一步宏默认值, 后续加 EEPROM 配置):
  * 主机主动发起, 回包驱动刷新; 等回包超时重发; 连续失败回握手 */
-#define RF_M3_RETRY_TIMEOUT_MS 500   /* 等回包超时(重发间隔) ms */
 #define RF_M3_RETRY_MAX        3     /* 连续重传上限, 超限回握手 */
 #define RF_M3_485_PERIOD       500   /* 485 空闲超时: 超时发保活命令占用轮次(条件2) ms */
 
@@ -63,8 +62,11 @@
 #define RF_LINK_DEAD_MS    5000   /* 5s 无有效帧: 链路断开, SYS LED 常亮报警 */
 
 /* 通联状态机 (所有发射模式前置): 未通联先握手, 通联成功才传数据 */
-#define RF_LINK_TRY_PERIOD_MS 200    /* 握手探测命令周期 (ms) */
-#define RF_LINK_LOST_MS       3000   /* 已通联后超时无帧 -> 掉线重握手 (ms) */
+/* ---- 以下 4 个超时为运行时值 (高速默认; 长距离模式由 rf_set_timeouts 放大) ---- */
+volatile uint16_t RF_M3_RETRY_TIMEOUT_MS = 500;  /* 等回包超时(重发间隔) ms */
+volatile uint16_t RF_LINK_TRY_PERIOD_MS  = 200;  /* 握手探测命令周期 (ms) */
+volatile uint16_t RF_LINK_LOST_MS        = 3000; /* 已通联后超时无帧 -> 掉线重握手 (ms) */
+volatile uint16_t RF_TX_WATCH_MS         = 500;  /* 发送卡死 Watchdog (ms) */
 
 /* ==================== 全局状态 ==================== */
 volatile uint8_t RF_APP_OVERFLOW = 0;   /* 任务堆叠计数 (非0 时 SYSTEM_LED 亮) */
@@ -287,10 +289,30 @@ static void rf_send_485_poll(void)
     UART1_LAST_TX_MS = TICK_MS;
 }
 
-/* ==================== 发送测试帧 (控制指令 0x20) ==================== */
+/* ==================== 往返测试 (控制指令 0x20) ====================
+ * 非阻塞: 触发即发任务0帧, 主循环正常调度; 收到从站回包时在 rf_app_poll
+ * 里记录真实往返耗时到 RF_RTT_MS (超时 0xFFFF)。避免阻塞 UART3 帧处理。*/
+volatile uint16_t RF_RTT_MS = 0xFFFF;   /* 真实回路往返 ms; 0xFFFF=未测/超时 */
 void rf_app_test_tx(void)
 {
-    rf_send_master(UART3_TX_CONTENT[0], UART3_TX_CI2[0]);   /* 任务0: CI₁ + CI₂ */
+    uint16_t t0;
+    if (UART3_RF_ROLE != RF_ROLE_MASTER) { RF_RTT_MS = 0xFFFF; return; }
+    RF_M3_RX_EVT = 0;                   /* 清陈旧回包 */
+    RF_RTT_MS = 0xFFFF;                 /* 先置未测 */
+    rf_send_master(UART3_TX_CONTENT[0], UART3_TX_CI2[0]);
+    t0 = TICK_MS;                       /* 发任务0 帧起点 (TICK_MS 全局时间戳) */
+    for (;;) {
+        rf_app_poll();                  /* 维持收发/解包 (TIM4 照常收包) */
+        if (RF_M3_RX_EVT) {             /* 收到从站回包 */
+            RF_M3_RX_EVT = 0;
+            RF_RTT_MS = (uint16_t)(TICK_MS - t0);
+            return;
+        }
+        if ((uint16_t)(TICK_MS - t0) > RF_M3_RETRY_TIMEOUT_MS) {
+            RF_RTT_MS = 0xFFFF;         /* 超时无回包 */
+            return;
+        }
+    }
 }
 
 /* ==================== 内部状态只读 (快照/诊断 0x2B~0x2C) ==================== */
@@ -431,7 +453,7 @@ void rf_app_poll(void)
     DBG_POS(2);   /* 位置码: rf_app_poll 入口 */
 
     /* 0. 发送超时兜底: RF_TX_BUSY 卡 500ms 未完成 -> 强制回接收 (防死锁) */
-    if (RF_TX_BUSY && (uint16_t)(TICK_MS - RF_TX_START_MS) > 500) {
+    if (RF_TX_BUSY && (uint16_t)(TICK_MS - RF_TX_START_MS) > RF_TX_WATCH_MS) {
         DBG_POS(3);   /* 位置码: 发送超时兜底 */
         rf_abort_tx();
         RF_TX_DONE = 1;               /* 让下方收尾消一次溢出 */
@@ -504,7 +526,7 @@ void rf_app_poll(void)
  */
 void rf_app_run(void)
 {
-    uint16_t now = rtc_get_ms();
+    uint16_t now = TICK_MS;   /* 全局 1ms 时间戳 (uint16 回绕, 差值正确; 勿用 rtc_get_ms=0..999) */
     uint8_t i;
 
     DBG_POS(1);   /* 位置码: rf_app_run 入口 */
@@ -678,6 +700,26 @@ void rf_app_run(void)
         RF_LINK_ALARM = 1;
         DBG_STR("[D]link_lost\r\n");
         rf_led_refresh();
+    }
+}
+
+/* ==================== 超时设置 (高速/长距离) ====================
+ * 长距离最坏情况 = 完整超帧 (前导+同步+长度+地址+载荷+CRC):
+ * LoRa SF12/BW125/CR4/8 下单帧 ~0.93s, 一次收发往返 ~1.85s。
+ * 长距离模式各超时取往返 2 倍以上, 且掉线阈值 > 任务周期(5000ms 演示), 防误判掉线。
+ * 高速(默认)保持原值, FSK/快链不受影响。 */
+void rf_set_timeouts(uint8_t long_range)
+{
+    if (long_range) {
+        RF_M3_RETRY_TIMEOUT_MS = 4000;  /* 等回包: > 一次往返 ~1.85s */
+        RF_LINK_LOST_MS        = 8000;  /* 掉线检测: > 任务周期 5000ms, 防误判 */
+        RF_LINK_TRY_PERIOD_MS  = 2000;  /* 握手探测: 探测+应答 ~1.85s */
+        RF_TX_WATCH_MS         = 3000;  /* TX 兜底: > 最慢单帧(SF12/BW125 ~0.93s+前导), 防误杀 */
+    } else {
+        RF_M3_RETRY_TIMEOUT_MS = 500;
+        RF_LINK_LOST_MS        = 3000;
+        RF_LINK_TRY_PERIOD_MS  = 200;
+        RF_TX_WATCH_MS         = 500;
     }
 }
 

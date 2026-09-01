@@ -24,6 +24,7 @@
 #define CFG_OFF_MAGIC   0
 #define CFG_OFF_VERSION 1
 #define CFG_OFF_RF      2          /* 射频白名单 RF_CFG_N 字节 */
+#define CFG_OFF_LONGRANGE 15       /* 长距离模式标志 (空闲字节, 1=放大 RF 超时) */
 #define CFG_OFF_CONTENT 16         /* 发射任务: CONTENT(CI₁)[32] */
 #define CFG_OFF_CI2     48         /* 发射任务: CI2[32] (要求从站回传) */
 #define CFG_OFF_ENA     80         /* 发射任务: ENA[32] */
@@ -51,8 +52,9 @@
 #define CFG_OFF_U1_TOL  262        /* UART1 485 组帧超时 低字节 */
 #define CFG_OFF_U1_TOH  263        /* UART1 485 组帧超时 高字节 */
 #define CFG_OFF_U1_EN   264        /* UART1 485 透传使能 */
-#define CFG_OFF_CRC     265        /* CRC-8, 覆盖 [0..264] */
-#define CFG_LEN         266        /* 配置区总长 */
+#define CFG_OFF_FSK     265        /* FSK 快照 FSK_CFG_N 字节 */
+#define CFG_OFF_CRC     278        /* CRC-8, 覆盖 [0..277] */
+#define CFG_LEN         279        /* 配置区总长 */
 
 /* ==================== 射频白名单 ====================
  * 仅这些寄存器会被保存/恢复: LoRa 配置类, 排除只读/状态/FIFO/指针寄存器
@@ -94,6 +96,7 @@ static uint8_t cfg_byte_at(const config_table_t *cfg, uint16_t off)
     if (off == CFG_OFF_MAGIC) return CFG_MAGIC;
     if (off == CFG_OFF_VERSION) return CFG_VERSION;
     if (off >= CFG_OFF_RF && off < CFG_OFF_RF + RF_CFG_N) return cfg->rf_cfg[off - CFG_OFF_RF];
+    if (off == CFG_OFF_LONGRANGE) return cfg->long_range;   /* 非1按0(高速), 旧数据=0 */
     if (off >= CFG_OFF_CONTENT && off < CFG_OFF_CONTENT + 32) return cfg->tx_content[off - CFG_OFF_CONTENT];
     if (off >= CFG_OFF_CI2 && off < CFG_OFF_CI2 + 32) return cfg->tx_ci2[off - CFG_OFF_CI2];
     if (off >= CFG_OFF_ENA && off < CFG_OFF_ENA + 32) return cfg->tx_ena[off - CFG_OFF_ENA];
@@ -132,6 +135,7 @@ static uint8_t cfg_byte_at(const config_table_t *cfg, uint16_t off)
     if (off == CFG_OFF_U1_TOL) return (uint8_t)(cfg->uart1_timeout & 0xFF);
     if (off == CFG_OFF_U1_TOH) return (uint8_t)(cfg->uart1_timeout >> 8);
     if (off == CFG_OFF_U1_EN) return cfg->uart1_en;
+    if (off >= CFG_OFF_FSK && off < CFG_OFF_FSK + FSK_CFG_N) return cfg->fsk[off - CFG_OFF_FSK];
     return 0;
 }
 
@@ -204,6 +208,13 @@ uint8_t config_load(config_table_t *cfg)
     cfg->uart1_timeout = (uint16_t)EEPROM_read(CFG_OFF_U1_TOL)
                        | ((uint16_t)EEPROM_read(CFG_OFF_U1_TOH) << 8);
     cfg->uart1_en      = (EEPROM_read(CFG_OFF_U1_EN) == 1) ? 1 : 0;
+
+    /* 长距离模式: 非1一律按0(高速) */
+    cfg->long_range = (EEPROM_read(CFG_OFF_LONGRANGE) == 1) ? 1 : 0;
+
+    /* FSK 快照 */
+    for (i = 0; i < FSK_CFG_N; i++)
+        cfg->fsk[i] = EEPROM_read(CFG_OFF_FSK + i);
     return 1;
 }
 
