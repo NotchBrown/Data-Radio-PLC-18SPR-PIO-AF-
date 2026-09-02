@@ -354,14 +354,14 @@ void rf_apply_config(void)
     cr_code = (uint8_t)(UART3_RF_CR - 4);          /* 5->1, 6->2, 7->3, 8->4 */
     if (cr_code < 1 || cr_code > 4) cr_code = 1;
     mc1 = (uint8_t)((bw_code << 4) | (cr_code << 1));
-    if (UART3_RF_SF < 6) UART3_RF_SF = 7;
+    if (UART3_RF_SF < 6) UART3_RF_SF = 6;   /* SF6 支持: 钳制下限 6 */
     if (UART3_RF_SF > 12) UART3_RF_SF = 12;
     /* LowDataRateOptimize (bit0): SF>=11 且 BW=125 时符号时长>16ms 必须开启,
      * 否则 SF11/12 @125kHz 无法可靠解调。 */
     rf_write_reg(REG_MODEM_CONFIG_1, mc1);
 
     /* ModemConfig2: SF(bit7:4) | RX CRC on(bit2) */
-    if (UART3_RF_SF < 6) UART3_RF_SF = 7;
+    if (UART3_RF_SF < 6) UART3_RF_SF = 6;   /* SF6 支持 */
     if (UART3_RF_SF > 12) UART3_RF_SF = 12;
     sf_code = (uint8_t)((UART3_RF_SF << 4) & 0xF0);
     mc2 = (uint8_t)(sf_code | 0x04);
@@ -388,6 +388,15 @@ void rf_apply_config(void)
 
     /* 杩?RXCONT (鍚?I/Q 鏋佹€?+ ERRATA 2.3 + mask) */
     rf_rx_start();
+    /* SF6 DetectOptimize/Threshold (官方 SF6=0x05/0x0C; 放 rf_rx_start 后覆盖其默认 0x03,
+       切回 SF7-12 自动还原 0x03/0x0A) */
+    if (UART3_RF_SF == 6) {
+        rf_write_reg(REG_DETECTOPTIMIZE, (uint8_t)((rf_read_reg(REG_DETECTOPTIMIZE) & 0xF8) | 0x05));
+        rf_write_reg(REG_DETECTIONTHRESHOLD, 0x0C);
+    } else {
+        rf_write_reg(REG_DETECTOPTIMIZE, (uint8_t)((rf_read_reg(REG_DETECTOPTIMIZE) & 0xF8) | 0x03));
+        rf_write_reg(REG_DETECTIONTHRESHOLD, 0x0A);
+    }
     RF_ENABLED = 1;              /* 鍞ら啋: 鍏佽 TIM4 rf_poll 鎺ョ鏀跺彂 */
 }
 
